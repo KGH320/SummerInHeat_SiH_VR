@@ -9,7 +9,7 @@
     <LangVersion>latest</LangVersion>
     <WarningLevel>8</WarningLevel>
     <RootNamespace>UnityVRMod</RootNamespace>
-    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>    
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
 	<Configurations>BIE_Unity_Mono_OpenVR_Debug;BIE_Unity_Mono_OpenVR_Release;BIE_Unity_Cpp_OpenVR_Debug;BIE_Unity_Cpp_OpenVR_Release;BIE_Unity_Mono_OpenXR_Debug;BIE_Unity_Mono_OpenXR_Release;BIE_Unity_Cpp_OpenXR_Debug;BIE_Unity_Cpp_OpenXR_Release;BIE5_Unity_Mono_OpenVR_Debug;BIE5_Unity_Mono_OpenVR_Release;BIE5_Unity_Mono_OpenXR_Debug;BIE5_Unity_Mono_OpenXR_Release</Configurations>
     <NoWarn>$(NoWarn);NU1603</NoWarn>
     <PhysicsLog Condition="'$(PhysicsLog)'==''">false</PhysicsLog>
@@ -20,8 +20,8 @@
   </ItemGroup>
 
   <Target Name="PreBuild" BeforeTargets="PreBuildEvent">
-    <Exec Condition="$(DefineConstants.Contains('CPP')) AND $(DefineConstants.Contains('BIE')) AND $(DefineConstants.Contains('INTEROP'))" Command="dotnet build ..\UniverseLib\src\UniverseLib.sln -c Release_IL2CPP_Interop_BIE" />
-    <Exec Condition="$(DefineConstants.Contains('MONO')) AND $(DefineConstants.Contains('BIE'))" Command="dotnet build ..\UniverseLib\src\UniverseLib.sln -c Release_Mono" />
+    <Exec Condition="$(DefineConstants.Contains('CPP')) AND $(DefineConstants.Contains('BIE')) AND $(DefineConstants.Contains('INTEROP')) AND !Exists('..\UniverseLib\Release\UniverseLib.Il2Cpp.Interop\UniverseLib.BIE.IL2CPP.Interop.dll')" Command="dotnet build ..\UniverseLib\src\UniverseLib.sln -c Release_IL2CPP_Interop_BIE" />
+    <Exec Condition="$(DefineConstants.Contains('MONO')) AND $(DefineConstants.Contains('BIE')) AND !Exists('..\UniverseLib\Release\UniverseLib.Mono\UniverseLib.Mono.dll')" Command="dotnet build ..\UniverseLib\src\UniverseLib.sln -c Release_Mono" />
   </Target>
 
   <!-- BepInEx Unity MONO - OpenVR - DEBUG -->
@@ -67,7 +67,7 @@
     <DebugSymbols>false</DebugSymbols>
     <DebugType>none</DebugType>
   </PropertyGroup>
-  
+
   <!-- BepInEx Unity MONO - OpenXR - DEBUG -->
   <PropertyGroup Condition="'$(Configuration)'=='BIE_Unity_Mono_OpenXR_Debug'">
     <TargetFramework>net46</TargetFramework>
@@ -149,7 +149,7 @@
   <PropertyGroup Condition="'$(Configuration)'=='BIE5_Unity_Mono_OpenXR_Release'">
     <TargetFramework>net46</TargetFramework>
     <OutputPath>..\Release\OpenXR\UnityVRMod.BepInEx5.Mono\</OutputPath>
-    <DefineConstants>MONO,BIE,BIE5,OPENXR_BUILD</DefineConstants>
+    <DefineConstants>MONO,BIE,BIE5,OPENXR_BUILD,PHYSICS_LOG</DefineConstants>
     <AssemblyName>UnityVRMod.BepInEx5.Mono_OpenXR</AssemblyName>
     <Optimize>true</Optimize>
     <DebugSymbols>false</DebugSymbols>
@@ -163,10 +163,10 @@
   <!-- Conditional Source File Compilation -->
   <ItemGroup>
     <Compile Remove="Features\VRVisualization\VrCameraSetup_CoreOpenVR.cs" />
-    <Compile Remove="Features\VRVisualization\OpenVR\OpenVR.cs" /> 
+    <Compile Remove="Features\VRVisualization\OpenVR\OpenVR.cs" />
     <Compile Remove="Features\VRVisualization\VrCameraSetup_CoreOpenXR.cs" />
-    <Compile Remove="Features\VRVisualization\OpenXR\OpenXR.cs" /> 
-    <Compile Remove="Features\VRVisualization\OpenXR\NativeBridge.cs" /> 
+    <Compile Remove="Features\VRVisualization\OpenXR\OpenXR.cs" />
+    <Compile Remove="Features\VRVisualization\OpenXR\NativeBridge.cs" />
 
     <Compile Include="Features\VRVisualization\VrCameraSetup_CoreOpenVR.cs" Condition="$(DefineConstants.Contains('OPENVR_BUILD'))" />
     <Compile Include="Features\VRVisualization\OpenVR\OpenVR.cs" Condition="$(DefineConstants.Contains('OPENVR_BUILD'))" />
@@ -189,7 +189,7 @@
       <Private>True</Private>
     </Reference>
   </ItemGroup>
-  
+
   <!-- mono UniverseLib -->
   <ItemGroup Condition="$(DefineConstants.Contains('MONO'))">
     <Reference Include="UniverseLib">
@@ -211,7 +211,7 @@
 		<Private>False</Private>
 	</Reference>
 	<Reference Include="0Harmony">
-		<HintPath>..\..\game\GameData\BepInEx\core\0Harmony.dll</HintPath>
+		<HintPath>..\lib\bie6\0Harmony.dll</HintPath>
 		<Private>False</Private>
 	</Reference>
 	<Reference Include="UnityEngine">
@@ -223,11 +223,11 @@
 		<Private>False</Private>
 	</Reference>
 	<Reference Include="UnityEngine.CoreModule">
-		<HintPath>..\lib\mono\UnityEngine.CoreModule.dll</HintPath> 
+		<HintPath>..\lib\mono\UnityEngine.CoreModule.dll</HintPath>
 		<Private>False</Private>
 	</Reference>
 	<Reference Include="UnityEngine.AudioModule">
-		<HintPath>..\lib\mono\UnityEngine.AudioModule.dll</HintPath> 
+		<HintPath>..\lib\mono\UnityEngine.AudioModule.dll</HintPath>
 		<Private>False</Private>
 	</Reference>
   </ItemGroup>
@@ -299,7 +299,7 @@
       <Private>False</Private>
     </Reference>
   </ItemGroup>
-  
+
   <!-- OpenVR API Native DLL (Conditional Copy to Output) -->
   <ItemGroup Condition="$(DefineConstants.Contains('OPENVR_BUILD'))">
     <None Include="..\lib\openvr_api.dll">
@@ -307,7 +307,7 @@
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
   </ItemGroup>
-  
+
   <!-- OpenXR Native DLL (Conditional Copy to Output) -->
   <ItemGroup Condition="$(DefineConstants.Contains('OPENXR_BUILD'))">
     <None Include="..\lib\openxr_loader.dll">

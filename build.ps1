@@ -3,9 +3,12 @@ param (
     [string]$VrBackend,
     [switch]$MonoOnly,
     [switch]$Il2CppOnly,
+    [switch]$BIE5Only,
     [switch]$DebugBuild,
     [switch]$DebugHelper,
-    [switch]$PhysicsLog
+    [switch]$PhysicsLog,
+    [switch]$Deploy,
+    [string]$GameDir
 )
 
 function Resolve-MsBuildPath {
@@ -30,12 +33,13 @@ function Resolve-MsBuildPath {
 
 # --- Configuration ---
 $YourModName = "UnityVRMod"
-$SolutionFile = "src/UnityVRMod.sln" 
+$SolutionFile = "src/UnityVRMod.sln"
 $UniverseLibSln = "UniverseLib/src/UniverseLib.sln"
 $NativeHelperProjectSolution = "UnityGraphicsHelper/UnityGraphicsHelper.sln"
 $NativeHelperDllBuildOutputBase = "UnityGraphicsHelper/x64"
 $NativeHelperDllName = "UnityGraphicsHelper.dll"
 $LibDir = "lib"
+$OpenXrHandModelsDir = "OpenXRHandModels"
 
 # --- Tooling checks ---
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
@@ -44,7 +48,7 @@ if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
 }
 
 $MsBuildExe = Resolve-MsBuildPath
-$NativeBuildAvailable = ![string]::IsNullOrWhiteSpace($MsBuildExe)
+$NativeBuildAvailable = $false
 if (-not $NativeBuildAvailable) {
     Write-Warning "MSBuild not found. Native C++ helper DLL ($NativeHelperDllName) will NOT be built. OpenXR builds may fail if $NativeHelperDllName is missing from lib/."
     Write-Warning "To fix: Install Visual Studio 2022 Build Tools with MSBuild and C++ toolset (v143), or run from Developer PowerShell for VS."
@@ -109,9 +113,9 @@ if ($PhysicsLog.IsPresent) {
 # --- Base Definitions for Runtimes ---
 $MonoBaseDefinition = @{
     TargetRuntimeName = "Mono";
-    ConfigNamePattern = "BIE_Unity_Mono_{0}_{1}"; 
-    AssemblyNamePattern = "$($YourModName).BepInEx.Mono_{0}"; 
-    OutputPathPattern = "Release/{0}/$($YourModName).BepInEx.Mono"; 
+    ConfigNamePattern = "BIE_Unity_Mono_{0}_{1}";
+    AssemblyNamePattern = "$($YourModName).BepInEx.Mono_{0}";
+    OutputPathPattern = "Release/{0}/$($YourModName).BepInEx.Mono";
     UniverseLibDllPath = $UniverseLibMonoDllPath
 }
 $Il2CppBaseDefinition = @{
@@ -144,7 +148,10 @@ if (-not [string]::IsNullOrEmpty($VrBackend)) {
 $targetsToBuildActual = [System.Collections.Generic.List[System.Collections.Hashtable]]::new()
 $RuntimeDefinitionsToConsider = [System.Collections.Generic.List[System.Collections.Hashtable]]::new()
 
-if ($MonoOnly.IsPresent) {
+if ($BIE5Only.IsPresent) {
+    $RuntimeDefinitionsToConsider.Add($BIE5MonoBaseDefinition)
+}
+elseif ($MonoOnly.IsPresent) {
     $RuntimeDefinitionsToConsider.Add($MonoBaseDefinition);
     $RuntimeDefinitionsToConsider.Add($BIE5MonoBaseDefinition)
 }
@@ -174,7 +181,7 @@ if ($targetsToBuildActual.Count -eq 0) { Write-Error "No build targets were fina
 foreach ($currentTargetDef in $targetsToBuildActual) {
     $ConfigToUse = $currentTargetDef.FullConfigName
     $CurrentAssemblyName = $currentTargetDef.EffectiveAssemblyName
-    $CurrentOutputPath = "$($currentTargetDef.EffectiveOutputPathBase)${OutputFolderSuffix}" 
+    $CurrentOutputPath = "$($currentTargetDef.EffectiveOutputPathBase)${OutputFolderSuffix}"
     $FinalDllName = "$($CurrentAssemblyName).dll"
 
     Write-Host ""
@@ -196,29 +203,75 @@ foreach ($currentTargetDef in $targetsToBuildActual) {
     Write-Host "  Build successful: $OutputDllPath"
 
     Write-Host "  Preparing final plugin directory structure..."
-    $FinalPluginSubDir = Join-Path $CurrentOutputPath "plugins\$YourModName" 
+    $FinalPluginSubDir = Join-Path $CurrentOutputPath "plugins\$YourModName"
     New-Item -Path $FinalPluginSubDir -ItemType Directory -Force | Out-Null
 
      Move-Item -Path $OutputDllPath -Destination (Join-Path $FinalPluginSubDir "$YourModName.dll") -Force
      Copy-Item $currentTargetDef.UniverseLibDllPath -Destination $FinalPluginSubDir -Force
-     
-     $ModelSourceDir = "src/Model"
-     if (Test-Path $ModelSourceDir) {
-         $ModelDestDir = Join-Path $FinalPluginSubDir "Model"
-         New-Item -Path $ModelDestDir -ItemType Directory -Force | Out-Null
-         Copy-Item (Join-Path $ModelSourceDir "*") -Destination $ModelDestDir -Recurse -Force
-         Write-Host "  Copied model assets to: $ModelDestDir"
-     }
-     
+
+
+
      if ($currentTargetDef.VrBackend -eq "OpenVR") {
          Copy-Item (Join-Path $LibDir "openvr_api.dll") -Destination $FinalPluginSubDir -Force
      } elseif ($currentTargetDef.VrBackend -eq "OpenXR") {
         Copy-Item (Join-Path $LibDir "openxr_loader.dll") -Destination $FinalPluginSubDir -Force
         Copy-Item (Join-Path $LibDir $NativeHelperDllName) -Destination $FinalPluginSubDir -Force
+        $OpenXrHandModelsSource = Join-Path $PSScriptRoot $OpenXrHandModelsDir
+        if (Test-Path $OpenXrHandModelsSource) {
+            Copy-Item -Path $OpenXrHandModelsSource -Destination $FinalPluginSubDir -Recurse -Force
+            Write-Host "  Copied OpenXR hand models to plugin output."
+        } else {
+            Write-Warning "OpenXR hand models directory not found: $OpenXrHandModelsSource"
+        }
     }
-    
+
     Write-Host "  $($currentTargetDef.TargetRuntimeName) build for $VrBackend complete. Output: $FinalPluginSubDir"
     Write-Host "--------------------------------------------------"
 }
 
 Write-Host "Build script finished."
+
+# --- Deploy ---
+if ($Deploy) {
+    Write-Host ""
+    Write-Host "=================================================="
+    Write-Host " Deploying DLLs to game directory..."
+    Write-Host "=================================================="
+
+    # Game directory config - modify this default to match your install path
+    $DeployGameDir = if (-not [string]::IsNullOrWhiteSpace($GameDir)) { $GameDir } else { "D:\RPG\summer" }
+
+    if (-not (Test-Path $DeployGameDir)) {
+        Write-Error "Game directory not found: $DeployGameDir"
+        Write-Host "Use -GameDir parameter to specify the correct path."
+        exit 1
+    }
+
+    $DeployVrBackend = if ([string]::IsNullOrWhiteSpace($VrBackend)) { "OpenXR" } else { $VrBackend }
+    $RuntimeName = if ($BIE5Only) { "BepInEx5.Mono" } else { "BepInEx.Mono" }
+
+    $SourceDll = Join-Path $PSScriptRoot "Release\$DeployVrBackend\UnityVRMod.$RuntimeName\plugins\UnityVRMod\UnityVRMod.dll"
+    $DestDir = Join-Path $DeployGameDir "GameData\BepInEx\plugins\UnityVRMod"
+
+    if (-not (Test-Path $SourceDll)) {
+        Write-Error "Source DLL not found: $SourceDll"
+        exit 1
+    }
+
+    if (-not (Test-Path $DestDir)) {
+        New-Item -Path $DestDir -ItemType Directory -Force | Out-Null
+    }
+
+    Copy-Item -Path $SourceDll -Destination $DestDir -Force
+    Write-Host "Deployed: $SourceDll -> $DestDir"
+
+    if ($DeployVrBackend -eq "OpenXR") {
+        $SourceHandModelsDir = Join-Path $PSScriptRoot $OpenXrHandModelsDir
+        if (Test-Path $SourceHandModelsDir) {
+            Copy-Item -Path $SourceHandModelsDir -Destination $DestDir -Recurse -Force
+            Write-Host "Deployed OpenXR hand models: $SourceHandModelsDir -> $DestDir"
+        } else {
+            Write-Warning "OpenXR hand models directory not found: $SourceHandModelsDir"
+        }
+    }
+}
