@@ -202,7 +202,94 @@ namespace UnityVRMod.Features.VrVisualization
             }
 
             AppendFocusedPhysicsFieldDump(sb, components);
+            AppendBlendShapeDump(sb, root);
             AppendAllComponentsDump(sb, components);
+        }
+
+        private static void AppendBlendShapeDump(StringBuilder sb, GameObject root)
+        {
+            if (root == null)
+            {
+                return;
+            }
+
+            SkinnedMeshRenderer[] renderers = root.GetComponentsInChildren<SkinnedMeshRenderer>(true);
+            if (renderers == null || renderers.Length == 0)
+            {
+                sb.AppendLine();
+                sb.Append("    blendshape-dump skinnedMeshRenderers=0");
+                return;
+            }
+
+            int rendererWithBlendShapes = 0;
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                SkinnedMeshRenderer renderer = renderers[i];
+                Mesh mesh = renderer == null ? null : renderer.sharedMesh;
+                if (mesh != null && mesh.blendShapeCount > 0)
+                {
+                    rendererWithBlendShapes++;
+                }
+            }
+
+            sb.AppendLine();
+            sb.Append("    blendshape-dump skinnedMeshRenderers=");
+            sb.Append(renderers.Length);
+            sb.Append(" withBlendShapes=");
+            sb.Append(rendererWithBlendShapes);
+
+            for (int i = 0; i < renderers.Length; i++)
+            {
+                SkinnedMeshRenderer renderer = renderers[i];
+                if (renderer == null)
+                {
+                    sb.AppendLine();
+                    sb.Append("      #");
+                    sb.Append(i + 1);
+                    sb.Append(" <missing SkinnedMeshRenderer>");
+                    continue;
+                }
+
+                Mesh mesh = renderer.sharedMesh;
+                int blendShapeCount = mesh == null ? 0 : mesh.blendShapeCount;
+
+                sb.AppendLine();
+                sb.Append("      #");
+                sb.Append(i + 1);
+                sb.Append(" ");
+                sb.Append(GetGameObjectPath(renderer.gameObject));
+                sb.Append(" :: SkinnedMeshRenderer");
+                sb.Append(" enabled=");
+                sb.Append(renderer.enabled);
+                sb.Append(" active=");
+                sb.Append(renderer.gameObject.activeInHierarchy);
+                sb.Append(" mesh=");
+                sb.Append(mesh == null ? "null" : mesh.name);
+                sb.Append(" blendShapeCount=");
+                sb.Append(blendShapeCount);
+                sb.Append(" rootBone=");
+                sb.Append(renderer.rootBone == null ? "null" : GetGameObjectPath(renderer.rootBone.gameObject));
+                sb.Append(" boundsCenter=");
+                sb.Append(FormatVector(renderer.bounds.center));
+                sb.Append(" boundsExtents=");
+                sb.Append(FormatVector(renderer.bounds.extents));
+
+                if (mesh == null || blendShapeCount == 0)
+                {
+                    continue;
+                }
+
+                for (int blendShapeIndex = 0; blendShapeIndex < blendShapeCount; blendShapeIndex++)
+                {
+                    sb.AppendLine();
+                    sb.Append("        [");
+                    sb.Append(blendShapeIndex);
+                    sb.Append("] ");
+                    sb.Append(mesh.GetBlendShapeName(blendShapeIndex));
+                    sb.Append(" weight=");
+                    sb.Append(renderer.GetBlendShapeWeight(blendShapeIndex).ToString("F3"));
+                }
+            }
         }
 
         private static void AppendAllComponentsDump(StringBuilder sb, Component[] components)

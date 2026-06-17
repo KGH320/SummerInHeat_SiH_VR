@@ -1,51 +1,48 @@
+#if OPENXR_BUILD
 using System;
 using System.Collections.Generic;
-using System.Globalization;
 using System.IO;
 using System.Reflection;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityVRMod.Config;
 using UnityVRMod.Core;
 
 namespace UnityVRMod.Features.VrVisualization
 {
     internal sealed class OpenXrControllerVisualizer
     {
-        private const string DefaultObjRootPath = @"E:\gal\summer\oculus-controller-art-v1.8\Meta Quest Touch Plus\models\OBJ";
-        private const string LeftObjFileName = "Left.obj";
-        private const string RightObjFileName = "Right.obj";
-        private const float TargetControllerLongestAxisMeters = 0.16f;
-        private const float ControllerSphereDiameterMeters = 0.07f;
-        private static readonly Quaternion LeftModelRotationOffset = Quaternion.identity;
-        private static readonly Quaternion RightModelRotationOffset = Quaternion.identity;
         private static readonly Vector3 LeftModelPositionOffset = Vector3.zero;
         private static readonly Vector3 RightModelPositionOffset = Vector3.zero;
-        private static readonly Color LeftControllerColor = new(0.10f, 0.45f, 1.00f, 0.95f);
-        private static readonly Color RightControllerColor = new(1.00f, 0.15f, 0.15f, 0.95f);
-
-        private static Mesh s_leftMesh;
-        private static Mesh s_rightMesh;
-        private static Texture2D s_leftTexture;
-        private static Texture2D s_rightTexture;
-        private static bool s_meshLoadAttempted;
-        private static MethodInfo s_loadImageMethod;
+        private static readonly Quaternion LeftModelRotationOffset = Quaternion.identity;
+        private static readonly Quaternion RightModelRotationOffset = Quaternion.identity;
 
         private Transform _rigTransform;
         private GameObject _root;
-        private GameObject _leftControllerObject;
-        private GameObject _rightControllerObject;
-        private Material _leftControllerMaterial;
-        private Material _rightControllerMaterial;
+        private RuntimeHandModel _leftHand;
+        private RuntimeHandModel _rightHand;
+        private object _assetBundle;
+        private RuntimeHandPoseData _handPoseData;
+        private RuntimeHandColliderLayoutData _handColliderLayoutData;
+        private string _loadedBundlePath = string.Empty;
+        private bool _loadAttempted;
+        private bool _missingBundleLogged;
+        private MethodInfo _assetBundleLoadAssetMethod;
+        private MethodInfo _assetBundleUnloadMethod;
 
         public void Update(
             GameObject vrRig,
-            int vrRigLayer,
+            int handRenderLayer,
             bool hasLeftPose,
             Vector3 leftWorldPos,
             Quaternion leftWorldRot,
+            float leftGripValue,
+            float leftTriggerValue,
             bool hasRightPose,
             Vector3 rightWorldPos,
             Quaternion rightWorldRot,
+            float rightGripValue,
+            float rightTriggerValue,
             OpenXrControlHand activeControlHand)
         {
             if (vrRig == null)
@@ -54,16 +51,14 @@ namespace UnityVRMod.Features.VrVisualization
                 return;
             }
 
-            EnsureInitialized(vrRig, vrRigLayer);
+            EnsureInitialized(vrRig, handRenderLayer);
             if (_root == null)
             {
                 return;
             }
 
-            bool showLeft = hasLeftPose;
-            bool showRight = hasRightPose;
-            UpdateControllerObject(_leftControllerObject, showLeft, leftWorldPos, leftWorldRot, LeftModelPositionOffset, LeftModelRotationOffset);
-            UpdateControllerObject(_rightControllerObject, showRight, rightWorldPos, rightWorldRot, RightModelPositionOffset, RightModelRotationOffset);
+            UpdateHand(_leftHand, isLeftHand: true, hasLeftPose, leftWorldPos, leftWorldRot, LeftModelPositionOffset, LeftModelRotationOffset, leftGripValue, leftTriggerValue);
+            UpdateHand(_rightHand, isLeftHand: false, hasRightPose, rightWorldPos, rightWorldRot, RightModelPositionOffset, RightModelRotationOffset, rightGripValue, rightTriggerValue);
         }
 
         public void Teardown()
@@ -74,24 +69,32 @@ namespace UnityVRMod.Features.VrVisualization
                 _root = null;
             }
 
-            if (_leftControllerMaterial != null)
-            {
-                UnityEngine.Object.Destroy(_leftControllerMaterial);
-                _leftControllerMaterial = null;
-            }
-
-            if (_rightControllerMaterial != null)
-            {
-                UnityEngine.Object.Destroy(_rightControllerMaterial);
-                _rightControllerMaterial = null;
-            }
-
-            _leftControllerObject = null;
-            _rightControllerObject = null;
+            _leftHand = null;
+            _rightHand = null;
             _rigTransform = null;
+            OpenXrHandModelAnchorRegistry.Clear(isLeftHand: true);
+            OpenXrHandModelAnchorRegistry.Clear(isLeftHand: false);
+
+            if (_assetBundle != null && _assetBundleUnloadMethod != null)
+            {
+                try
+                {
+                    _assetBundleUnloadMethod.Invoke(_assetBundle, new object[] { false });
+                }
+                catch
+                {
+                }
+            }
+
+            _assetBundle = null;
+            _handPoseData = null;
+            _handColliderLayoutData = null;
+            _loadedBundlePath = string.Empty;
+            _loadAttempted = false;
+            _missingBundleLogged = false;
         }
 
-        private void EnsureInitialized(GameObject vrRig, int vrRigLayer)
+        private void EnsureInitialized(GameObject vrRig, int handRenderLayer)
         {
             if (vrRig == null)
             {
@@ -109,133 +112,302 @@ namespace UnityVRMod.Features.VrVisualization
             }
 
             _rigTransform = vrRig.transform;
-            _root = new GameObject("OpenXR_ControllerVisualizer");
+            _root = new GameObject("OpenXR_HandVisualizer");
             _root.transform.SetParent(vrRig.transform, false);
             _root.transform.localPosition = Vector3.zero;
             _root.transform.localRotation = Quaternion.identity;
             _root.transform.localScale = Vector3.one;
 
-            TryLoadMeshesIfNeeded();
-            bool hasObjModel = s_leftMesh != null || s_rightMesh != null;
-            _leftControllerMaterial = CreateControllerMaterial(LeftControllerColor);
-            _rightControllerMaterial = CreateControllerMaterial(RightControllerColor);
+            if (!EnsureAssetBundleLoaded())
+            {
+                return;
+            }
 
-            _leftControllerObject = CreateControllerObject("OpenXR_LeftControllerModel", _leftControllerMaterial, vrRigLayer, s_leftMesh);
-            _rightControllerObject = CreateControllerObject("OpenXR_RightControllerModel", _rightControllerMaterial, vrRigLayer, s_rightMesh);
+            _handPoseData = LoadHandPoseData();
+            _handColliderLayoutData = LoadHandColliderLayoutData();
 
-            VRModCore.Log(hasObjModel
-                ? "[OpenXR][ControllerModel] Using OBJ controller models for left/right controllers."
-                : "[OpenXR][ControllerModel] OBJ models not found, using procedural capsule fallback.");
+            string leftPrefabName = ConfigManager.OpenXR_LeftHandModelName?.Value ?? "LeftHand";
+            string rightPrefabName = ConfigManager.OpenXR_RightHandModelName?.Value ?? "RightHand";
+            _leftHand = InstantiateHandModel(leftPrefabName, "OpenXR_LeftHandModel", isLeftHand: true, handRenderLayer);
+            _rightHand = InstantiateHandModel(rightPrefabName, "OpenXR_RightHandModel", isLeftHand: false, handRenderLayer);
+
+            if (_leftHand == null || _rightHand == null)
+            {
+                VRModCore.LogWarning($"[OpenXR][HandModel] Failed to instantiate hand prefabs. Left='{leftPrefabName}', Right='{rightPrefabName}', Bundle='{_loadedBundlePath}'");
+                return;
+            }
+
+            VRModCore.Log($"[OpenXR][HandModel] Loaded hand prefabs from AssetBundle. Left='{leftPrefabName}', Right='{rightPrefabName}'");
         }
 
-        private void UpdateControllerObject(
-            GameObject targetObject,
+        private bool EnsureAssetBundleLoaded()
+        {
+            string bundlePath = ResolveHandModelBundlePath();
+            if (string.IsNullOrWhiteSpace(bundlePath) || !File.Exists(bundlePath))
+            {
+                if (!_missingBundleLogged)
+                {
+                    _missingBundleLogged = true;
+                    VRModCore.LogWarning($"[OpenXR][HandModel] Hand AssetBundle not found: '{bundlePath}'. No procedural hand fallback will be created.");
+                }
+
+                return false;
+            }
+
+            if (_assetBundle != null && string.Equals(_loadedBundlePath, bundlePath, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+
+            if (_loadAttempted && _assetBundle == null && string.Equals(_loadedBundlePath, bundlePath, StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            _loadAttempted = true;
+            _loadedBundlePath = bundlePath;
+
+            Type assetBundleType = ResolveTypeAnyAssembly("UnityEngine.AssetBundle");
+            MethodInfo loadFromFileMethod = assetBundleType?.GetMethod("LoadFromFile", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
+            _assetBundleLoadAssetMethod = assetBundleType?.GetMethod("LoadAsset", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(string), typeof(Type) }, null);
+            _assetBundleUnloadMethod = assetBundleType?.GetMethod("Unload", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(bool) }, null);
+
+            if (assetBundleType == null || loadFromFileMethod == null || _assetBundleLoadAssetMethod == null)
+            {
+                VRModCore.LogWarning("[OpenXR][HandModel] UnityEngine.AssetBundle API not found; external hand models cannot be loaded in this runtime.");
+                return false;
+            }
+
+            try
+            {
+                _assetBundle = loadFromFileMethod.Invoke(null, new object[] { bundlePath });
+                if (_assetBundle == null)
+                {
+                    VRModCore.LogWarning($"[OpenXR][HandModel] AssetBundle.LoadFromFile returned null: '{bundlePath}'");
+                    return false;
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                VRModCore.LogWarning($"[OpenXR][HandModel] Failed loading AssetBundle '{bundlePath}': {ex.Message}");
+                _assetBundle = null;
+                return false;
+            }
+        }
+
+        private RuntimeHandModel InstantiateHandModel(string prefabName, string objectName, bool isLeftHand, int handRenderLayer)
+        {
+            if (_assetBundle == null || _assetBundleLoadAssetMethod == null || string.IsNullOrWhiteSpace(prefabName))
+            {
+                return null;
+            }
+
+            try
+            {
+                object asset = _assetBundleLoadAssetMethod.Invoke(_assetBundle, new object[] { prefabName, typeof(GameObject) });
+                if (asset is not GameObject prefab)
+                {
+                    VRModCore.LogWarning($"[OpenXR][HandModel] Prefab '{prefabName}' not found in AssetBundle.");
+                    return null;
+                }
+
+                GameObject instance = UnityEngine.Object.Instantiate(prefab);
+                instance.name = objectName;
+                instance.transform.SetParent(_root.transform, false);
+                instance.transform.localPosition = Vector3.zero;
+                instance.transform.localRotation = Quaternion.identity;
+                float scale = Mathf.Clamp(ConfigManager.OpenXR_HandModelScale?.Value ?? 1.0f, 0.01f, 100f);
+                instance.transform.localScale = new Vector3(scale, scale, scale);
+                SetLayerRecursively(instance, handRenderLayer);
+
+                var model = new RuntimeHandModel(instance, isLeftHand, _handPoseData?.GetSide(isLeftHand), _handColliderLayoutData?.GetSide(isLeftHand));
+                model.PrepareRuntimeComponents();
+                model.ResolveBones();
+                return model;
+            }
+            catch (Exception ex)
+            {
+                VRModCore.LogWarning($"[OpenXR][HandModel] Failed instantiating prefab '{prefabName}': {ex.Message}");
+                return null;
+            }
+        }
+
+        private RuntimeHandPoseData LoadHandPoseData()
+        {
+            if (_assetBundle == null || _assetBundleLoadAssetMethod == null)
+            {
+                return null;
+            }
+
+            string[] assetNames =
+            {
+                "OpenXRHandPoses",
+                "OpenXRHandPoses.json",
+                "assets/unityvrmod/openxrhandmodels/openxrhandposes.json"
+            };
+
+            for (int i = 0; i < assetNames.Length; i++)
+            {
+                string assetName = assetNames[i];
+                try
+                {
+                    object asset = _assetBundleLoadAssetMethod.Invoke(_assetBundle, new object[] { assetName, typeof(TextAsset) });
+                    if (asset is not TextAsset textAsset || string.IsNullOrWhiteSpace(textAsset.text))
+                    {
+                        continue;
+                    }
+
+                    RuntimeHandPoseData poseData = RuntimeHandPoseData.TryParse(textAsset.text);
+                    if (poseData == null)
+                    {
+                        VRModCore.LogWarning($"[OpenXR][HandModel] Hand pose asset '{assetName}' was found but could not be parsed.");
+                        return null;
+                    }
+
+                    VRModCore.Log($"[OpenXR][HandModel] Loaded baked hand poses from AssetBundle asset '{assetName}'.");
+                    return poseData;
+                }
+                catch (Exception ex)
+                {
+                    VRModCore.LogWarning($"[OpenXR][HandModel] Failed loading hand pose asset '{assetName}': {ex.Message}");
+                    return null;
+                }
+            }
+
+            VRModCore.LogWarning("[OpenXR][HandModel] Baked hand pose asset 'OpenXRHandPoses' not found; falling back to runtime axis curl.");
+            return null;
+        }
+
+        private RuntimeHandColliderLayoutData LoadHandColliderLayoutData()
+        {
+            if (_assetBundle == null || _assetBundleLoadAssetMethod == null)
+            {
+                return null;
+            }
+
+            string[] assetNames =
+            {
+                "OpenXRHandColliders",
+                "OpenXRHandColliders.json",
+                "assets/unityvrmod/openxrhandmodels/openxrhandcolliders.json"
+            };
+
+            for (int i = 0; i < assetNames.Length; i++)
+            {
+                string assetName = assetNames[i];
+                try
+                {
+                    object asset = _assetBundleLoadAssetMethod.Invoke(_assetBundle, new object[] { assetName, typeof(TextAsset) });
+                    if (asset is not TextAsset textAsset || string.IsNullOrWhiteSpace(textAsset.text))
+                    {
+                        continue;
+                    }
+
+                    RuntimeHandColliderLayoutData colliderLayoutData = RuntimeHandColliderLayoutData.TryParse(textAsset.text);
+                    if (colliderLayoutData == null)
+                    {
+                        VRModCore.LogWarning($"[OpenXR][HandModel] Hand collider layout asset '{assetName}' was found but could not be parsed.");
+                        return null;
+                    }
+
+                    VRModCore.Log($"[OpenXR][HandModel] Loaded baked hand collider layout from AssetBundle asset '{assetName}'.");
+                    return colliderLayoutData;
+                }
+                catch (Exception ex)
+                {
+                    VRModCore.LogWarning($"[OpenXR][HandModel] Failed loading hand collider layout asset '{assetName}': {ex.Message}");
+                    return null;
+                }
+            }
+
+            VRModCore.LogWarning("[OpenXR][HandModel] Baked hand collider layout asset 'OpenXRHandColliders' not found; falling back to palm/fingertip colliders.");
+            return null;
+        }
+
+        private void UpdateHand(
+            RuntimeHandModel hand,
+            bool isLeftHand,
             bool hasPose,
             Vector3 worldPos,
             Quaternion worldRot,
             Vector3 localOffset,
-            Quaternion rotationOffset)
+            Quaternion rotationOffset,
+            float gripValue,
+            float triggerValue)
         {
-            if (targetObject == null)
+            if (hand == null || hand.Root == null)
             {
+                OpenXrHandModelAnchorRegistry.Clear(isLeftHand);
                 return;
             }
 
             if (!hasPose)
             {
-                if (targetObject.activeSelf)
+                if (hand.Root.activeSelf)
                 {
-                    targetObject.SetActive(false);
+                    hand.Root.SetActive(false);
                 }
+
+                OpenXrHandModelAnchorRegistry.Clear(isLeftHand);
                 return;
             }
 
-            if (!targetObject.activeSelf)
+            if (!hand.Root.activeSelf)
             {
-                targetObject.SetActive(true);
+                hand.Root.SetActive(true);
             }
 
-            targetObject.transform.position = worldPos + (worldRot * localOffset);
-            targetObject.transform.rotation = worldRot * rotationOffset;
+            hand.Root.transform.position = worldPos + (worldRot * localOffset);
+            hand.Root.transform.rotation = worldRot * rotationOffset;
+            hand.UpdatePose(gripValue, triggerValue, ConfigManager.OpenXR_HandFingerCurlDegrees?.Value ?? 65f);
+            hand.UpdateColliderAnchorRegistry();
         }
 
-        private GameObject CreateControllerObject(string objectName, Material material, int vrRigLayer, Mesh mesh)
+        private static string ResolveHandModelBundlePath()
         {
-            GameObject go;
-            if (mesh != null)
+            string configuredPath = ConfigManager.OpenXR_HandModelBundlePath?.Value ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(configuredPath))
             {
-                go = new GameObject(objectName);
-                var mf = go.AddComponent<MeshFilter>();
-                mf.sharedMesh = mesh;
-                var mr = go.AddComponent<MeshRenderer>();
-                mr.shadowCastingMode = ShadowCastingMode.Off;
-                mr.receiveShadows = false;
-                mr.sharedMaterial = material;
+                configuredPath = @"OpenXRHandModels\openxr_hands";
             }
-            else
+
+            configuredPath = configuredPath.Trim().Trim('"');
+            if (Path.IsPathRooted(configuredPath))
             {
-                go = CreateProceduralController(objectName, material);
+                return configuredPath;
             }
-            go.transform.SetParent(_root.transform, false);
-            go.transform.localPosition = Vector3.zero;
-            go.transform.localRotation = Quaternion.identity;
-            SetLayerRecursively(go, vrRigLayer);
-            return go;
+
+            string assemblyDir = Path.GetDirectoryName(typeof(OpenXrControllerVisualizer).Assembly.Location) ?? string.Empty;
+            return Path.Combine(assemblyDir, configuredPath);
         }
 
-        private static GameObject CreateProceduralController(string name, Material material)
+        private static Type ResolveTypeAnyAssembly(string fullTypeName)
         {
-            var root = new GameObject(name);
-            // 手柄主体：胶囊体
-            var body = GameObject.CreatePrimitive(PrimitiveType.Capsule);
-            body.name = "Body";
-            body.transform.SetParent(root.transform, false);
-            body.transform.localPosition = Vector3.zero;
-            body.transform.localRotation = Quaternion.identity;
-            body.transform.localScale = new Vector3(0.03f, 0.05f, 0.03f);
-            DestroyCollider(body);
-            ApplyMaterial(body, material);
-            // 追踪环：圆环（用缩放压扁的环体模拟）
-            var ring = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
-            ring.name = "Ring";
-            ring.transform.SetParent(root.transform, false);
-            ring.transform.localPosition = new Vector3(0f, 0.045f, 0f);
-            ring.transform.localRotation = Quaternion.identity;
-            ring.transform.localScale = new Vector3(0.035f, 0.008f, 0.035f);
-            DestroyCollider(ring);
-            ApplyMaterial(ring, material);
-            return root;
-        }
-
-        private static void DestroyCollider(GameObject go)
-        {
-            var col = go.GetComponent("Collider");
-            if (col != null) UnityEngine.Object.Destroy(col);
-        }
-
-        private static void ApplyMaterial(GameObject go, Material material)
-        {
-            var renderer = go.GetComponent<Renderer>();
-            if (renderer != null)
+            Type type = Type.GetType(fullTypeName, false);
+            if (type != null)
             {
-                renderer.shadowCastingMode = ShadowCastingMode.Off;
-                renderer.receiveShadows = false;
-                renderer.sharedMaterial = material;
+                return type;
             }
-        }
 
-        private static Material CreateControllerMaterial(Color color)
-        {
-            Shader shader = Shader.Find("Unlit/Color");
-            if (shader == null) shader = Shader.Find("Sprites/Default");
-            if (shader == null) shader = Shader.Find("Legacy Shaders/Diffuse");
-
-            Material material = new Material(shader)
+            Assembly[] assemblies = AppDomain.CurrentDomain.GetAssemblies();
+            for (int i = 0; i < assemblies.Length; i++)
             {
-                color = color
-            };
+                Assembly assembly = assemblies[i];
+                if (assembly == null)
+                {
+                    continue;
+                }
 
-            return material;
+                type = assembly.GetType(fullTypeName, false);
+                if (type != null)
+                {
+                    return type;
+                }
+            }
+
+            return null;
         }
 
         private static void SetLayerRecursively(GameObject root, int layer)
@@ -249,517 +421,1106 @@ namespace UnityVRMod.Features.VrVisualization
             }
         }
 
-        private static void TryLoadMeshesIfNeeded()
+        private void SetVisible(bool leftVisible, bool rightVisible)
         {
-            if (s_meshLoadAttempted)
+            if (_leftHand?.Root != null && _leftHand.Root.activeSelf != leftVisible)
             {
-                return;
+                _leftHand.Root.SetActive(leftVisible);
             }
 
-            s_meshLoadAttempted = true;
-
-            string leftObjPath = Path.Combine(DefaultObjRootPath, LeftObjFileName);
-            string rightObjPath = Path.Combine(DefaultObjRootPath, RightObjFileName);
-
-            s_leftMesh = TryLoadObjMesh(leftObjPath, "OpenXR_LeftControllerOBJ", out string leftTexturePath);
-            s_rightMesh = TryLoadObjMesh(rightObjPath, "OpenXR_RightControllerOBJ", out string rightTexturePath);
-
-            s_leftTexture = TryLoadTexture(leftTexturePath, "OpenXR_LeftControllerTexture");
-            s_rightTexture = TryLoadTexture(rightTexturePath, "OpenXR_RightControllerTexture");
-
-            if (s_leftMesh == null || s_rightMesh == null)
+            if (_rightHand?.Root != null && _rightHand.Root.activeSelf != rightVisible)
             {
-                VRModCore.LogWarning($"[OpenXR][ControllerModel] Failed to load OBJ controller models. Left='{leftObjPath}', Right='{rightObjPath}'");
+                _rightHand.Root.SetActive(rightVisible);
             }
-            else
+
+            if (!leftVisible)
             {
-                VRModCore.Log($"[OpenXR][ControllerModel] Model mapping Left='{Path.GetFileName(leftObjPath)}' Right='{Path.GetFileName(rightObjPath)}' SphereDiameter={ControllerSphereDiameterMeters:F2}");
+                OpenXrHandModelAnchorRegistry.Clear(isLeftHand: true);
+            }
+
+            if (!rightVisible)
+            {
+                OpenXrHandModelAnchorRegistry.Clear(isLeftHand: false);
             }
         }
 
-        private static Texture2D TryLoadTexture(string texturePath, string textureName)
+        private sealed class RuntimeHandModel
         {
-            if (string.IsNullOrWhiteSpace(texturePath))
+            private readonly bool _isLeftHand;
+            private readonly RuntimeHandPoseSet _poseSet;
+            private readonly RuntimeHandColliderLayoutSet _colliderLayoutSet;
+            private readonly RuntimeFingerBones _thumb = new(OpenXrHandFinger.Thumb);
+            private readonly RuntimeFingerBones _index = new(OpenXrHandFinger.Index);
+            private readonly RuntimeFingerBones _middle = new(OpenXrHandFinger.Middle);
+            private readonly RuntimeFingerBones _ring = new(OpenXrHandFinger.Ring);
+            private readonly RuntimeFingerBones _little = new(OpenXrHandFinger.Little);
+            private RuntimeBoundHandPoseSet _boundPoseSet;
+            private RuntimeBoundHandColliderLayoutSet _boundColliderLayoutSet;
+            private Transform _palm;
+            private float _lastGrip = -1f;
+            private float _lastTrigger = -1f;
+            private float _lastCurlDegrees = float.NaN;
+
+            public RuntimeHandModel(GameObject root, bool isLeftHand, RuntimeHandPoseSet poseSet, RuntimeHandColliderLayoutSet colliderLayoutSet)
             {
-                return null;
+                Root = root;
+                _isLeftHand = isLeftHand;
+                _poseSet = poseSet;
+                _colliderLayoutSet = colliderLayoutSet;
             }
 
-            try
+            public GameObject Root { get; }
+
+            public void PrepareRuntimeComponents()
             {
-                if (!File.Exists(texturePath))
-                {
-                    VRModCore.LogWarning($"[OpenXR][ControllerModel] Texture file missing: {texturePath}");
-                    return null;
-                }
-
-                byte[] bytes = File.ReadAllBytes(texturePath);
-                if (bytes == null || bytes.Length == 0)
-                {
-                    return null;
-                }
-
-                var texture = new Texture2D(2, 2, TextureFormat.RGBA32, false)
-                {
-                    name = textureName
-                };
-                if (!TryLoadImage(texture, bytes))
-                {
-                    UnityEngine.Object.Destroy(texture);
-                    return null;
-                }
-
-                texture.wrapMode = TextureWrapMode.Clamp;
-                texture.anisoLevel = 2;
-                return texture;
+                DisablePoseOverriders();
+                NormalizeRenderMaterials();
             }
-            catch (Exception ex)
-            {
-                VRModCore.LogWarning($"[OpenXR][ControllerModel] Failed loading texture '{texturePath}': {ex.Message}");
-                return null;
-            }
-        }
 
-        private static bool TryLoadImage(Texture2D texture, byte[] bytes)
-        {
-            if (texture == null || bytes == null || bytes.Length == 0) return false;
-
-            if (s_loadImageMethod == null)
+            public void ResolveBones()
             {
-                s_loadImageMethod = ResolveLoadImageMethod();
-                if (s_loadImageMethod == null)
+                Transform[] transforms = Root.GetComponentsInChildren<Transform>(true);
+                _palm = FindPalm(transforms) ?? Root.transform;
+                ResolveFinger(transforms, _thumb);
+                ResolveFinger(transforms, _index);
+                ResolveFinger(transforms, _middle);
+                ResolveFinger(transforms, _ring);
+                ResolveFinger(transforms, _little);
+                Vector3 fourFingerCurlAxisWorld = ResolveFourFingerCurlAxisWorld();
+                _thumb.CaptureCurlAxes(_palm, null);
+                _index.CaptureCurlAxes(_palm, fourFingerCurlAxisWorld);
+                _middle.CaptureCurlAxes(_palm, fourFingerCurlAxisWorld);
+                _ring.CaptureCurlAxes(_palm, fourFingerCurlAxisWorld);
+                _little.CaptureCurlAxes(_palm, fourFingerCurlAxisWorld);
+                _boundPoseSet = _poseSet?.Bind(Root.transform);
+                _boundColliderLayoutSet = _colliderLayoutSet?.Bind(Root.transform);
+
+                int resolvedFingerCount = 0;
+                if (_thumb.HasTip) resolvedFingerCount++;
+                if (_index.HasTip) resolvedFingerCount++;
+                if (_middle.HasTip) resolvedFingerCount++;
+                if (_ring.HasTip) resolvedFingerCount++;
+                if (_little.HasTip) resolvedFingerCount++;
+
+                VRModCore.Log($"[OpenXR][HandModel] {Root.name} resolved palm='{_palm.name}', fingerTips={resolvedFingerCount}/5.");
+                if (_boundPoseSet != null)
                 {
-                    VRModCore.LogWarning("[OpenXR][ControllerModel] ImageConversion.LoadImage API not found; texture loading disabled in this Unity runtime.");
+                    VRModCore.Log($"[OpenXR][HandModel] {Root.name} bound baked pose bones={_boundPoseSet.BoneCount}.");
+                }
+
+                if (_boundColliderLayoutSet != null)
+                {
+                    VRModCore.Log($"[OpenXR][HandModel] {Root.name} bound baked collider layout spheres={_boundColliderLayoutSet.ColliderCount}.");
+                }
+            }
+
+            public void UpdatePose(float gripValue, float triggerValue, float curlDegrees)
+            {
+                float grip = Mathf.Clamp01(gripValue);
+                float trigger = Mathf.Clamp01(triggerValue);
+                if (Mathf.Abs(grip - _lastGrip) < 0.002f
+                    && Mathf.Abs(trigger - _lastTrigger) < 0.002f
+                    && Mathf.Abs(curlDegrees - _lastCurlDegrees) < 0.01f)
+                {
+                    return;
+                }
+
+                _lastGrip = grip;
+                _lastTrigger = trigger;
+                _lastCurlDegrees = curlDegrees;
+
+                if (_boundPoseSet != null)
+                {
+                    _boundPoseSet.Apply(grip, trigger);
+                    return;
+                }
+
+                ApplyFingerCurl(_thumb, Mathf.Clamp01(grip * 0.45f + trigger * 0.15f), curlDegrees * 0.55f);
+                ApplyFingerCurl(_index, trigger, curlDegrees);
+                ApplyFingerCurl(_middle, grip, curlDegrees);
+                ApplyFingerCurl(_ring, grip, curlDegrees);
+                ApplyFingerCurl(_little, grip, curlDegrees);
+            }
+
+            public void UpdateColliderAnchorRegistry()
+            {
+                if (_boundColliderLayoutSet != null)
+                {
+                    OpenXrHandModelAnchorRegistry.Update(_isLeftHand, _boundColliderLayoutSet.BuildWorldColliderPoses());
+                    return;
+                }
+
+                OpenXrHandModelAnchorRegistry.Update(
+                    _isLeftHand,
+                    _palm,
+                    _thumb.Tip,
+                    _index.Tip,
+                    _middle.Tip,
+                    _ring.Tip,
+                    _little.Tip);
+            }
+
+            private static void ApplyFingerCurl(RuntimeFingerBones finger, float curl, float curlDegrees)
+            {
+                if (finger == null || !finger.HasAnyBone)
+                {
+                    return;
+                }
+
+                float proximalDegrees = curlDegrees * curl * 0.45f;
+                float intermediateDegrees = curlDegrees * curl * 0.35f;
+                float distalDegrees = curlDegrees * curl * 0.25f;
+
+                ApplyLocalAxis(finger.Proximal, finger.ProximalOpenRotation, finger.ProximalCurlAxis, proximalDegrees);
+                ApplyLocalAxis(finger.Intermediate, finger.IntermediateOpenRotation, finger.IntermediateCurlAxis, intermediateDegrees);
+                ApplyLocalAxis(finger.Distal, finger.DistalOpenRotation, finger.DistalCurlAxis, distalDegrees);
+            }
+
+            private static void ApplyLocalAxis(Transform bone, Quaternion openRotation, Vector3 localAxis, float degrees)
+            {
+                if (bone == null)
+                {
+                    return;
+                }
+
+                if (localAxis.sqrMagnitude <= 0.0001f)
+                {
+                    localAxis = Vector3.right;
+                }
+
+                bone.localRotation = openRotation * Quaternion.AngleAxis(degrees, localAxis.normalized);
+            }
+
+            private static Transform FindPalm(Transform[] transforms)
+            {
+                return FindNamedTransform(transforms, "wrist_r")
+                    ?? FindNamedTransform(transforms, "wrist_l")
+                    ?? FindBestTransform(transforms, new[] { "palm", "hand", "wrist" }, Array.Empty<string>());
+            }
+
+            private static void ResolveFinger(Transform[] transforms, RuntimeFingerBones finger)
+            {
+                string[] aliases = GetFingerAliases(finger.Finger);
+                var candidates = new List<Transform>(8);
+                for (int i = 0; i < transforms.Length; i++)
+                {
+                    Transform transform = transforms[i];
+                    string normalized = NormalizeName(transform.name);
+                    if (ContainsAny(normalized, aliases))
+                    {
+                        candidates.Add(transform);
+                    }
+                }
+
+                if (candidates.Count == 0)
+                {
+                    return;
+                }
+
+                candidates.Sort(static (a, b) => GetHierarchyDepth(a).CompareTo(GetHierarchyDepth(b)));
+                string steamVrNamePrefix = GetSteamVrFingerPrefix(finger.Finger);
+                finger.Proximal = FindSteamVrFingerBone(candidates, steamVrNamePrefix, "0")
+                    ?? FindBestTransform(candidates, new[] { "proximal", "metacarpal", "base", "00", "0" }, new[] { "aux", "meta", "end" })
+                    ?? candidates[0];
+                finger.Intermediate = FindSteamVrFingerBone(candidates, steamVrNamePrefix, "1")
+                    ?? FindBestTransform(candidates, new[] { "intermediate", "middle", "01", "1" }, new[] { "aux", "meta", "end", "tip" })
+                    ?? FindChildAfter(finger.Proximal, candidates);
+                finger.Distal = FindSteamVrFingerBone(candidates, steamVrNamePrefix, "2")
+                    ?? FindBestTransform(candidates, new[] { "distal", "02", "2" }, new[] { "aux", "meta", "end" })
+                    ?? FindChildAfter(finger.Intermediate, candidates);
+                finger.Tip = FindSteamVrFingerBone(candidates, steamVrNamePrefix, "end")
+                    ?? FindBestTransform(candidates, new[] { "tip", "end", "03", "3" }, new[] { "aux", "meta" })
+                    ?? finger.Distal
+                    ?? finger.Intermediate
+                    ?? finger.Proximal;
+
+                finger.CaptureOpenRotations();
+            }
+
+            private Vector3 ResolveFourFingerCurlAxisWorld()
+            {
+                Vector3 axisWorld;
+                if (TryGetAxisBetweenFingerBases(_index, _little, out axisWorld)
+                    || TryGetAxisBetweenFingerBases(_index, _ring, out axisWorld)
+                    || TryGetAxisBetweenFingerBases(_middle, _little, out axisWorld))
+                {
+                    return axisWorld;
+                }
+
+                return Vector3.zero;
+            }
+
+            private static bool TryGetAxisBetweenFingerBases(RuntimeFingerBones from, RuntimeFingerBones to, out Vector3 axisWorld)
+            {
+                axisWorld = Vector3.zero;
+                Transform fromBase = from?.BaseBone;
+                Transform toBase = to?.BaseBone;
+                if (fromBase == null || toBase == null)
+                {
                     return false;
                 }
-            }
 
-            try
-            {
-                ParameterInfo[] parameters = s_loadImageMethod.GetParameters();
-                object result;
-                if (parameters.Length == 2)
-                {
-                    result = s_loadImageMethod.Invoke(null, new object[] { texture, bytes });
-                }
-                else if (parameters.Length == 3)
-                {
-                    result = s_loadImageMethod.Invoke(null, new object[] { texture, bytes, false });
-                }
-                else
+                Vector3 delta = toBase.position - fromBase.position;
+                if (delta.sqrMagnitude <= 0.000001f)
                 {
                     return false;
                 }
 
-                if (s_loadImageMethod.ReturnType == typeof(bool))
-                {
-                    return result is bool ok && ok;
-                }
-
+                axisWorld = delta.normalized;
                 return true;
             }
-            catch (Exception ex)
+
+            private void DisablePoseOverriders()
             {
-                VRModCore.LogWarning($"[OpenXR][ControllerModel] ImageConversion.LoadImage invoke failed: {ex.Message}");
+                Component[] components = Root.GetComponentsInChildren<Component>(true);
+                for (int i = 0; i < components.Length; i++)
+                {
+                    Component component = components[i];
+                    if (component == null)
+                    {
+                        continue;
+                    }
+
+                    Type componentType = component.GetType();
+                    string typeName = componentType.FullName ?? componentType.Name;
+                    if (typeName.IndexOf("Animator", StringComparison.OrdinalIgnoreCase) >= 0
+                        || typeName.IndexOf("Animation", StringComparison.OrdinalIgnoreCase) >= 0
+                        || typeName.IndexOf("SteamVR", StringComparison.OrdinalIgnoreCase) >= 0
+                        || typeName.IndexOf("Skeleton", StringComparison.OrdinalIgnoreCase) >= 0
+                        || typeName.IndexOf("Poser", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        if (component is Behaviour behaviour)
+                        {
+                            behaviour.enabled = false;
+                        }
+                    }
+                }
+            }
+
+            private void NormalizeRenderMaterials()
+            {
+                Renderer[] renderers = Root.GetComponentsInChildren<Renderer>(true);
+                Shader opaqueShader = Shader.Find("Standard")
+                    ?? Shader.Find("Legacy Shaders/Diffuse")
+                    ?? Shader.Find("Diffuse");
+
+                int normalizedRendererCount = 0;
+                for (int r = 0; r < renderers.Length; r++)
+                {
+                    Renderer renderer = renderers[r];
+                    if (renderer == null)
+                    {
+                        continue;
+                    }
+
+                    renderer.shadowCastingMode = ShadowCastingMode.Off;
+                    renderer.receiveShadows = false;
+
+                    Material[] materials = renderer.materials;
+                    for (int m = 0; m < materials.Length; m++)
+                    {
+                        Material material = materials[m];
+                        if (material == null)
+                        {
+                            continue;
+                        }
+
+                        if (opaqueShader != null && (material.shader == null || material.shader.name.IndexOf("SteamVR", StringComparison.OrdinalIgnoreCase) >= 0))
+                        {
+                            material.shader = opaqueShader;
+                        }
+
+                        ForceOpaqueDoubleSided(material);
+                    }
+
+                    renderer.materials = materials;
+                    normalizedRendererCount++;
+                }
+
+                VRModCore.Log($"[OpenXR][HandModel] {Root.name} normalized renderers={normalizedRendererCount} for opaque two-sided rendering.");
+            }
+
+            private static void ForceOpaqueDoubleSided(Material material)
+            {
+                if (material == null)
+                {
+                    return;
+                }
+
+                Color color = material.HasProperty("_Color") ? material.color : Color.white;
+                color.a = 1f;
+                if (material.HasProperty("_Color")) material.color = color;
+                if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", color);
+                if (material.HasProperty("_TintColor")) material.SetColor("_TintColor", color);
+
+                if (material.HasProperty("_Mode")) material.SetFloat("_Mode", 0f);
+                if (material.HasProperty("_Surface")) material.SetFloat("_Surface", 0f);
+                if (material.HasProperty("_Blend")) material.SetFloat("_Blend", 0f);
+                if (material.HasProperty("_SrcBlend")) material.SetInt("_SrcBlend", (int)BlendMode.One);
+                if (material.HasProperty("_DstBlend")) material.SetInt("_DstBlend", (int)BlendMode.Zero);
+                if (material.HasProperty("_ZWrite")) material.SetInt("_ZWrite", 1);
+                if (material.HasProperty("_Cull")) material.SetInt("_Cull", (int)CullMode.Off);
+
+                material.DisableKeyword("_ALPHATEST_ON");
+                material.DisableKeyword("_ALPHABLEND_ON");
+                material.DisableKeyword("_ALPHAPREMULTIPLY_ON");
+                material.DisableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                material.renderQueue = (int)RenderQueue.Geometry;
+            }
+
+            private static Transform FindNamedTransform(IReadOnlyList<Transform> transforms, string exactName)
+            {
+                string normalizedExactName = NormalizeName(exactName);
+                for (int i = 0; i < transforms.Count; i++)
+                {
+                    Transform transform = transforms[i];
+                    if (transform != null && string.Equals(NormalizeName(transform.name), normalizedExactName, StringComparison.Ordinal))
+                    {
+                        return transform;
+                    }
+                }
+
+                return null;
+            }
+
+            private static Transform FindSteamVrFingerBone(IReadOnlyList<Transform> transforms, string fingerPrefix, string segment)
+            {
+                if (string.IsNullOrEmpty(fingerPrefix) || string.IsNullOrEmpty(segment))
+                {
+                    return null;
+                }
+
+                string expected = NormalizeName($"finger_{fingerPrefix}_{segment}_r");
+                for (int i = 0; i < transforms.Count; i++)
+                {
+                    Transform transform = transforms[i];
+                    if (transform != null && string.Equals(NormalizeName(transform.name), expected, StringComparison.Ordinal))
+                    {
+                        return transform;
+                    }
+                }
+
+                string expectedLeft = NormalizeName($"finger_{fingerPrefix}_{segment}_l");
+                for (int i = 0; i < transforms.Count; i++)
+                {
+                    Transform transform = transforms[i];
+                    if (transform != null && string.Equals(NormalizeName(transform.name), expectedLeft, StringComparison.Ordinal))
+                    {
+                        return transform;
+                    }
+                }
+
+                return null;
+            }
+
+            private static Transform FindBestTransform(IReadOnlyList<Transform> transforms, string[] includeTokens, string[] excludeTokens)
+            {
+                for (int i = 0; i < transforms.Count; i++)
+                {
+                    Transform transform = transforms[i];
+                    string normalized = NormalizeName(transform.name);
+                    if (ContainsAny(normalized, includeTokens) && !ContainsAny(normalized, excludeTokens))
+                    {
+                        return transform;
+                    }
+                }
+
+                return null;
+            }
+
+            private static Transform FindChildAfter(Transform current, IReadOnlyList<Transform> candidates)
+            {
+                if (current == null)
+                {
+                    return null;
+                }
+
+                int currentDepth = GetHierarchyDepth(current);
+                Transform best = null;
+                int bestDepth = int.MaxValue;
+                for (int i = 0; i < candidates.Count; i++)
+                {
+                    Transform candidate = candidates[i];
+                    int candidateDepth = GetHierarchyDepth(candidate);
+                    if (candidateDepth <= currentDepth || !IsDescendantOf(candidate, current))
+                    {
+                        continue;
+                    }
+
+                    if (candidateDepth < bestDepth)
+                    {
+                        best = candidate;
+                        bestDepth = candidateDepth;
+                    }
+                }
+
+                return best;
+            }
+
+            private static bool IsDescendantOf(Transform transform, Transform possibleParent)
+            {
+                Transform current = transform.parent;
+                while (current != null)
+                {
+                    if (current == possibleParent)
+                    {
+                        return true;
+                    }
+
+                    current = current.parent;
+                }
+
+                return false;
+            }
+
+            private static int GetHierarchyDepth(Transform transform)
+            {
+                int depth = 0;
+                Transform current = transform;
+                while (current != null)
+                {
+                    depth++;
+                    current = current.parent;
+                }
+
+                return depth;
+            }
+
+            private static string[] GetFingerAliases(OpenXrHandFinger finger)
+            {
+                return finger switch
+                {
+                    OpenXrHandFinger.Thumb => new[] { "thumb" },
+                    OpenXrHandFinger.Index => new[] { "index", "pointer" },
+                    OpenXrHandFinger.Middle => new[] { "middle" },
+                    OpenXrHandFinger.Ring => new[] { "ring" },
+                    OpenXrHandFinger.Little => new[] { "little", "pinky", "pinkie" },
+                    _ => Array.Empty<string>()
+                };
+            }
+
+            private static string GetSteamVrFingerPrefix(OpenXrHandFinger finger)
+            {
+                return finger switch
+                {
+                    OpenXrHandFinger.Thumb => "thumb",
+                    OpenXrHandFinger.Index => "index",
+                    OpenXrHandFinger.Middle => "middle",
+                    OpenXrHandFinger.Ring => "ring",
+                    OpenXrHandFinger.Little => "pinky",
+                    _ => string.Empty
+                };
+            }
+
+            private static bool ContainsAny(string normalized, string[] tokens)
+            {
+                if (string.IsNullOrEmpty(normalized) || tokens == null || tokens.Length == 0)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < tokens.Length; i++)
+                {
+                    if (!string.IsNullOrEmpty(tokens[i]) && normalized.IndexOf(tokens[i], StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        return true;
+                    }
+                }
+
+                return false;
+            }
+
+            private static string NormalizeName(string value)
+            {
+                if (string.IsNullOrEmpty(value))
+                {
+                    return string.Empty;
+                }
+
+                return value.Replace("_", string.Empty).Replace("-", string.Empty).Replace(" ", string.Empty).ToLowerInvariant();
+            }
+        }
+
+        private sealed class RuntimeHandPoseData
+        {
+            private RuntimeHandPoseData(RuntimeHandPoseSet left, RuntimeHandPoseSet right)
+            {
+                Left = left;
+                Right = right;
+            }
+
+            private RuntimeHandPoseSet Left { get; }
+            private RuntimeHandPoseSet Right { get; }
+
+            public RuntimeHandPoseSet GetSide(bool isLeftHand)
+            {
+                return isLeftHand ? Left : Right;
+            }
+
+            public static RuntimeHandPoseData TryParse(string json)
+            {
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    return null;
+                }
+
+                try
+                {
+                    if (!OpenXrHandAssetJsonParser.TryParsePoses(json, out OpenXrHandPoseJsonSide leftJson, out OpenXrHandPoseJsonSide rightJson))
+                    {
+                        return null;
+                    }
+
+                    RuntimeHandPoseSet left = RuntimeHandPoseSet.FromJson(leftJson);
+                    RuntimeHandPoseSet right = RuntimeHandPoseSet.FromJson(rightJson);
+                    if ((left == null || left.Count == 0) && (right == null || right.Count == 0))
+                    {
+                        return null;
+                    }
+
+                    return new RuntimeHandPoseData(left, right);
+                }
+                catch (Exception ex)
+                {
+                    VRModCore.LogWarning($"[OpenXR][HandModel] Failed parsing baked hand pose JSON: {ex.Message}");
+                    return null;
+                }
+            }
+        }
+
+        private sealed class RuntimeHandColliderLayoutData
+        {
+            private RuntimeHandColliderLayoutData(RuntimeHandColliderLayoutSet left, RuntimeHandColliderLayoutSet right)
+            {
+                Left = left;
+                Right = right;
+            }
+
+            private RuntimeHandColliderLayoutSet Left { get; }
+            private RuntimeHandColliderLayoutSet Right { get; }
+
+            public RuntimeHandColliderLayoutSet GetSide(bool isLeftHand)
+            {
+                return isLeftHand ? Left : Right;
+            }
+
+            public static RuntimeHandColliderLayoutData TryParse(string json)
+            {
+                if (string.IsNullOrWhiteSpace(json))
+                {
+                    return null;
+                }
+
+                try
+                {
+                    if (!OpenXrHandAssetJsonParser.TryParseColliderLayout(json, out OpenXrHandColliderLayoutJsonSide leftJson, out OpenXrHandColliderLayoutJsonSide rightJson))
+                    {
+                        return null;
+                    }
+
+                    RuntimeHandColliderLayoutSet left = RuntimeHandColliderLayoutSet.FromJson(leftJson);
+                    RuntimeHandColliderLayoutSet right = RuntimeHandColliderLayoutSet.FromJson(rightJson);
+                    if ((left == null || left.Count == 0) && (right == null || right.Count == 0))
+                    {
+                        return null;
+                    }
+
+                    return new RuntimeHandColliderLayoutData(left, right);
+                }
+                catch (Exception ex)
+                {
+                    VRModCore.LogWarning($"[OpenXR][HandModel] Failed parsing baked hand collider layout JSON: {ex.Message}");
+                    return null;
+                }
+            }
+        }
+
+        private sealed class RuntimeHandColliderLayoutSet
+        {
+            private readonly RuntimeHandColliderLayoutSphere[] _spheres;
+
+            private RuntimeHandColliderLayoutSet(RuntimeHandColliderLayoutSphere[] spheres)
+            {
+                _spheres = spheres ?? Array.Empty<RuntimeHandColliderLayoutSphere>();
+            }
+
+            public int Count => _spheres.Length;
+
+            public static RuntimeHandColliderLayoutSet FromJson(OpenXrHandColliderLayoutJsonSide json)
+            {
+                if (json == null || json.Colliders == null || json.Colliders.Length == 0)
+                {
+                    return null;
+                }
+
+                var spheres = new List<RuntimeHandColliderLayoutSphere>(Mathf.Min(json.Colliders.Length, OpenXrHandPoseModel.MaxColliderPoseCount));
+                for (int i = 0; i < json.Colliders.Length && spheres.Count < OpenXrHandPoseModel.MaxColliderPoseCount; i++)
+                {
+                    OpenXrHandColliderLayoutJsonCollider collider = json.Colliders[i];
+                    if (collider == null
+                        || string.IsNullOrWhiteSpace(collider.Name)
+                        || string.IsNullOrWhiteSpace(collider.Bone)
+                        || collider.Radius <= 0f)
+                    {
+                        continue;
+                    }
+
+                    spheres.Add(new RuntimeHandColliderLayoutSphere(
+                        collider.Name,
+                        collider.Bone,
+                        new Vector3(collider.X, collider.Y, collider.Z),
+                        collider.Radius));
+                }
+
+                return spheres.Count > 0 ? new RuntimeHandColliderLayoutSet(spheres.ToArray()) : null;
+            }
+
+            public RuntimeBoundHandColliderLayoutSet Bind(Transform root)
+            {
+                if (root == null || _spheres.Length == 0)
+                {
+                    return null;
+                }
+
+                Transform[] transforms = root.GetComponentsInChildren<Transform>(true);
+                var transformByName = new Dictionary<string, Transform>(StringComparer.Ordinal);
+                for (int i = 0; i < transforms.Length; i++)
+                {
+                    Transform transform = transforms[i];
+                    if (transform != null && !transformByName.ContainsKey(transform.name))
+                    {
+                        transformByName.Add(transform.name, transform);
+                    }
+                }
+
+                var bound = new List<RuntimeBoundHandColliderLayoutSphere>(_spheres.Length);
+                for (int i = 0; i < _spheres.Length; i++)
+                {
+                    RuntimeHandColliderLayoutSphere sphere = _spheres[i];
+                    if (!transformByName.TryGetValue(sphere.BoneName, out Transform anchor))
+                    {
+                        continue;
+                    }
+
+                    bound.Add(new RuntimeBoundHandColliderLayoutSphere(anchor, sphere));
+                }
+
+                return bound.Count > 0 ? new RuntimeBoundHandColliderLayoutSet(bound.ToArray()) : null;
+            }
+        }
+
+        private sealed class RuntimeBoundHandColliderLayoutSet
+        {
+            private readonly RuntimeBoundHandColliderLayoutSphere[] _spheres;
+            private readonly OpenXrHandWorldColliderPose[] _poseBuffer;
+
+            public RuntimeBoundHandColliderLayoutSet(RuntimeBoundHandColliderLayoutSphere[] spheres)
+            {
+                _spheres = spheres ?? Array.Empty<RuntimeBoundHandColliderLayoutSphere>();
+                _poseBuffer = new OpenXrHandWorldColliderPose[_spheres.Length];
+            }
+
+            public int ColliderCount => _spheres.Length;
+
+            public IReadOnlyList<OpenXrHandWorldColliderPose> BuildWorldColliderPoses()
+            {
+                for (int i = 0; i < _spheres.Length; i++)
+                {
+                    _poseBuffer[i] = _spheres[i].BuildWorldColliderPose();
+                }
+
+                return _poseBuffer;
+            }
+        }
+
+        private sealed class RuntimeBoundHandColliderLayoutSphere
+        {
+            private readonly Transform _anchor;
+            private readonly RuntimeHandColliderLayoutSphere _sphere;
+
+            public RuntimeBoundHandColliderLayoutSphere(Transform anchor, RuntimeHandColliderLayoutSphere sphere)
+            {
+                _anchor = anchor;
+                _sphere = sphere;
+            }
+
+            public OpenXrHandWorldColliderPose BuildWorldColliderPose()
+            {
+                if (_anchor == null || _sphere == null)
+                {
+                    return default;
+                }
+
+                return new OpenXrHandWorldColliderPose(
+                    _sphere.Name,
+                    _anchor.TransformPoint(_sphere.LocalPosition),
+                    _anchor.rotation,
+                    _sphere.Radius / OpenXrHandPoseModel.ReferenceHandColliderRadius);
+            }
+        }
+
+        private sealed class RuntimeHandColliderLayoutSphere
+        {
+            public RuntimeHandColliderLayoutSphere(string name, string boneName, Vector3 localPosition, float radius)
+            {
+                Name = name;
+                BoneName = boneName;
+                LocalPosition = localPosition;
+                Radius = radius;
+            }
+
+            public string Name { get; }
+            public string BoneName { get; }
+            public Vector3 LocalPosition { get; }
+            public float Radius { get; }
+        }
+
+        private sealed class RuntimeHandPoseSet
+        {
+            private readonly Dictionary<string, RuntimeHandPoseBone> _bones;
+
+            private RuntimeHandPoseSet(Dictionary<string, RuntimeHandPoseBone> bones)
+            {
+                _bones = bones ?? new Dictionary<string, RuntimeHandPoseBone>(StringComparer.Ordinal);
+            }
+
+            public int Count => _bones.Count;
+
+            public static RuntimeHandPoseSet FromJson(OpenXrHandPoseJsonSide json)
+            {
+                if (json == null || json.Open == null || json.Open.Length == 0)
+                {
+                    return null;
+                }
+
+                Dictionary<string, Quaternion> open = BuildRotationMap(json.Open);
+                Dictionary<string, Quaternion> fist = BuildRotationMap(json.Fist);
+                Dictionary<string, Quaternion> indexCurl = BuildRotationMap(json.IndexCurl);
+                var bones = new Dictionary<string, RuntimeHandPoseBone>(StringComparer.Ordinal);
+
+                foreach (KeyValuePair<string, Quaternion> pair in open)
+                {
+                    string boneName = pair.Key;
+                    if (string.IsNullOrEmpty(boneName) || boneName.IndexOf("finger_", StringComparison.OrdinalIgnoreCase) < 0)
+                    {
+                        continue;
+                    }
+
+                    Quaternion openRotation = pair.Value;
+                    Quaternion fistRotation = fist.TryGetValue(boneName, out Quaternion fistValue) ? fistValue : openRotation;
+                    Quaternion indexRotation = indexCurl.TryGetValue(boneName, out Quaternion indexValue) ? indexValue : openRotation;
+                    if (!TryResolveFingerFromBoneName(boneName, out OpenXrHandFinger finger))
+                    {
+                        continue;
+                    }
+
+                    bones[boneName] = new RuntimeHandPoseBone(boneName, finger, openRotation, fistRotation, indexRotation);
+                }
+
+                return new RuntimeHandPoseSet(bones);
+            }
+
+            public RuntimeBoundHandPoseSet Bind(Transform root)
+            {
+                if (root == null || _bones.Count == 0)
+                {
+                    return null;
+                }
+
+                Transform[] transforms = root.GetComponentsInChildren<Transform>(true);
+                var transformByName = new Dictionary<string, Transform>(StringComparer.Ordinal);
+                for (int i = 0; i < transforms.Length; i++)
+                {
+                    Transform transform = transforms[i];
+                    if (transform != null && !transformByName.ContainsKey(transform.name))
+                    {
+                        transformByName.Add(transform.name, transform);
+                    }
+                }
+
+                var boundBones = new List<RuntimeBoundHandPoseBone>(_bones.Count);
+                foreach (RuntimeHandPoseBone poseBone in _bones.Values)
+                {
+                    if (!transformByName.TryGetValue(poseBone.BoneName, out Transform transform))
+                    {
+                        continue;
+                    }
+
+                    boundBones.Add(new RuntimeBoundHandPoseBone(transform, poseBone));
+                }
+
+                return boundBones.Count > 0 ? new RuntimeBoundHandPoseSet(boundBones.ToArray()) : null;
+            }
+
+            private static Dictionary<string, Quaternion> BuildRotationMap(OpenXrHandPoseJsonBone[] json)
+            {
+                var map = new Dictionary<string, Quaternion>(StringComparer.Ordinal);
+                if (json == null)
+                {
+                    return map;
+                }
+
+                for (int i = 0; i < json.Length; i++)
+                {
+                    OpenXrHandPoseJsonBone bone = json[i];
+                    if (bone == null || string.IsNullOrEmpty(bone.Bone))
+                    {
+                        continue;
+                    }
+
+                    map[bone.Bone] = Normalize(new Quaternion(bone.X, bone.Y, bone.Z, bone.W));
+                }
+
+                return map;
+            }
+
+            private static Quaternion Normalize(Quaternion rotation)
+            {
+                float length = Mathf.Sqrt(
+                    rotation.x * rotation.x
+                    + rotation.y * rotation.y
+                    + rotation.z * rotation.z
+                    + rotation.w * rotation.w);
+                if (length <= 0.000001f)
+                {
+                    return Quaternion.identity;
+                }
+
+                return new Quaternion(rotation.x / length, rotation.y / length, rotation.z / length, rotation.w / length);
+            }
+
+            private static bool TryResolveFingerFromBoneName(string boneName, out OpenXrHandFinger finger)
+            {
+                if (boneName.IndexOf("thumb", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    finger = OpenXrHandFinger.Thumb;
+                    return true;
+                }
+
+                if (boneName.IndexOf("index", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    finger = OpenXrHandFinger.Index;
+                    return true;
+                }
+
+                if (boneName.IndexOf("middle", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    finger = OpenXrHandFinger.Middle;
+                    return true;
+                }
+
+                if (boneName.IndexOf("ring", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    finger = OpenXrHandFinger.Ring;
+                    return true;
+                }
+
+                if (boneName.IndexOf("pinky", StringComparison.OrdinalIgnoreCase) >= 0
+                    || boneName.IndexOf("little", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    finger = OpenXrHandFinger.Little;
+                    return true;
+                }
+
+                finger = default;
                 return false;
             }
         }
 
-        private static MethodInfo ResolveLoadImageMethod()
+        private sealed class RuntimeBoundHandPoseSet
         {
-            const string imageConversionTypeName = "UnityEngine.ImageConversion";
-            for (int i = 0; i < AppDomain.CurrentDomain.GetAssemblies().Length; i++)
+            private readonly RuntimeBoundHandPoseBone[] _bones;
+
+            public RuntimeBoundHandPoseSet(RuntimeBoundHandPoseBone[] bones)
             {
-                Assembly asm = AppDomain.CurrentDomain.GetAssemblies()[i];
-                if (asm == null) continue;
-
-                Type imageConversionType = asm.GetType(imageConversionTypeName, false);
-                if (imageConversionType == null) continue;
-
-                MethodInfo[] methods = imageConversionType.GetMethods(BindingFlags.Public | BindingFlags.Static);
-                for (int m = 0; m < methods.Length; m++)
-                {
-                    MethodInfo method = methods[m];
-                    if (!string.Equals(method.Name, "LoadImage", StringComparison.Ordinal)) continue;
-
-                    ParameterInfo[] parameters = method.GetParameters();
-                    if (parameters.Length < 2 || parameters.Length > 3) continue;
-                    if (parameters[0].ParameterType != typeof(Texture2D)) continue;
-                    if (parameters[1].ParameterType != typeof(byte[])) continue;
-                    if (parameters.Length == 3 && parameters[2].ParameterType != typeof(bool)) continue;
-
-                    return method;
-                }
+                _bones = bones ?? Array.Empty<RuntimeBoundHandPoseBone>();
             }
 
-            return null;
+            public int BoneCount => _bones.Length;
+
+            public void Apply(float grip, float trigger)
+            {
+                grip = Mathf.Clamp01(grip);
+                trigger = Mathf.Clamp01(trigger);
+                for (int i = 0; i < _bones.Length; i++)
+                {
+                    _bones[i].Apply(grip, trigger);
+                }
+            }
         }
 
-        private static Mesh TryLoadObjMesh(string filePath, string meshName, out string diffuseTexturePath)
+        private sealed class RuntimeBoundHandPoseBone
         {
-            diffuseTexturePath = null;
+            private readonly Transform _transform;
+            private readonly RuntimeHandPoseBone _poseBone;
 
-            try
+            public RuntimeBoundHandPoseBone(Transform transform, RuntimeHandPoseBone poseBone)
             {
-                if (!File.Exists(filePath))
+                _transform = transform;
+                _poseBone = poseBone;
+            }
+
+            public void Apply(float grip, float trigger)
+            {
+                if (_transform == null || _poseBone == null)
                 {
-                    VRModCore.LogWarning($"[OpenXR][ControllerModel] OBJ file missing: {filePath}");
-                    return null;
+                    return;
                 }
 
-                string[] lines = File.ReadAllLines(filePath);
-                if (lines == null || lines.Length == 0)
+                Quaternion target;
+                switch (_poseBone.Finger)
                 {
-                    VRModCore.LogWarning($"[OpenXR][ControllerModel] OBJ file is empty: {filePath}");
-                    return null;
+                    case OpenXrHandFinger.Index:
+                        target = Quaternion.Slerp(_poseBone.OpenRotation, _poseBone.IndexCurlRotation, trigger);
+                        break;
+                    case OpenXrHandFinger.Thumb:
+                        float thumbGrip = Mathf.Clamp01(grip * 0.45f);
+                        float thumbTrigger = Mathf.Clamp01(trigger * 0.35f);
+                        target = Quaternion.Slerp(_poseBone.OpenRotation, _poseBone.FistRotation, thumbGrip);
+                        target = Quaternion.Slerp(target, _poseBone.IndexCurlRotation, thumbTrigger);
+                        break;
+                    default:
+                        target = Quaternion.Slerp(_poseBone.OpenRotation, _poseBone.FistRotation, grip);
+                        break;
                 }
 
-                diffuseTexturePath = TryResolveTexturePathFromObjAndMtl(filePath, lines);
+                _transform.localRotation = target;
+            }
+        }
 
-                var positions = new List<Vector3>(4096);
-                var texCoords = new List<Vector2>(4096);
-                var normals = new List<Vector3>(4096);
+        private sealed class RuntimeHandPoseBone
+        {
+            public RuntimeHandPoseBone(
+                string boneName,
+                OpenXrHandFinger finger,
+                Quaternion openRotation,
+                Quaternion fistRotation,
+                Quaternion indexCurlRotation)
+            {
+                BoneName = boneName;
+                Finger = finger;
+                OpenRotation = openRotation;
+                FistRotation = fistRotation;
+                IndexCurlRotation = indexCurlRotation;
+            }
 
-                var outVertices = new List<Vector3>(8192);
-                var outTexCoords = new List<Vector2>(8192);
-                var outNormals = new List<Vector3>(8192);
-                var outTriangles = new List<int>(16384);
-                var vertexCache = new Dictionary<string, int>(16384, StringComparer.Ordinal);
+            public string BoneName { get; }
+            public OpenXrHandFinger Finger { get; }
+            public Quaternion OpenRotation { get; }
+            public Quaternion FistRotation { get; }
+            public Quaternion IndexCurlRotation { get; }
+        }
 
-                bool sawNormals = false;
-                NumberFormatInfo numberFormat = CultureInfo.InvariantCulture.NumberFormat;
+        private sealed class RuntimeFingerBones
+        {
+            public RuntimeFingerBones(OpenXrHandFinger finger)
+            {
+                Finger = finger;
+            }
 
-                for (int i = 0; i < lines.Length; i++)
+            public OpenXrHandFinger Finger { get; }
+            public Transform Proximal { get; set; }
+            public Transform Intermediate { get; set; }
+            public Transform Distal { get; set; }
+            public Transform Tip { get; set; }
+            public Quaternion ProximalOpenRotation { get; private set; }
+            public Quaternion IntermediateOpenRotation { get; private set; }
+            public Quaternion DistalOpenRotation { get; private set; }
+            public Vector3 ProximalCurlAxis { get; private set; } = Vector3.right;
+            public Vector3 IntermediateCurlAxis { get; private set; } = Vector3.right;
+            public Vector3 DistalCurlAxis { get; private set; } = Vector3.right;
+            public bool HasTip => Tip != null;
+            public bool HasAnyBone => Proximal != null || Intermediate != null || Distal != null;
+            public Transform BaseBone => Proximal ?? Intermediate ?? Distal ?? Tip;
+
+            public void CaptureOpenRotations()
+            {
+                ProximalOpenRotation = Proximal != null ? Proximal.localRotation : Quaternion.identity;
+                IntermediateOpenRotation = Intermediate != null ? Intermediate.localRotation : Quaternion.identity;
+                DistalOpenRotation = Distal != null ? Distal.localRotation : Quaternion.identity;
+            }
+
+            public void CaptureCurlAxes(Transform palm, Vector3? sharedHingeAxisWorld)
+            {
+                ProximalCurlAxis = ComputeCurlAxis(Proximal, ProximalOpenRotation, Intermediate ?? Distal ?? Tip, palm, Tip, sharedHingeAxisWorld);
+                IntermediateCurlAxis = ComputeCurlAxis(Intermediate, IntermediateOpenRotation, Distal ?? Tip, palm, Tip, sharedHingeAxisWorld);
+                DistalCurlAxis = ComputeCurlAxis(Distal, DistalOpenRotation, Tip, palm, Tip, sharedHingeAxisWorld);
+            }
+
+            private static Vector3 ComputeCurlAxis(
+                Transform bone,
+                Quaternion openRotation,
+                Transform child,
+                Transform palm,
+                Transform sampleTip,
+                Vector3? sharedHingeAxisWorld)
+            {
+                if (bone == null || palm == null)
                 {
-                    string line = lines[i];
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-                    line = line.Trim();
-                    if (line.Length == 0 || line[0] == '#') continue;
-
-                    if (line.StartsWith("v ", StringComparison.Ordinal))
-                    {
-                        if (TryParseVector3(line, numberFormat, out Vector3 v))
-                        {
-                            positions.Add(v);
-                        }
-                        continue;
-                    }
-
-                    if (line.StartsWith("vt ", StringComparison.Ordinal))
-                    {
-                        if (TryParseVector2(line, numberFormat, out Vector2 vt))
-                        {
-                            texCoords.Add(vt);
-                        }
-                        continue;
-                    }
-
-                    if (line.StartsWith("vn ", StringComparison.Ordinal))
-                    {
-                        if (TryParseVector3(line, numberFormat, out Vector3 vn))
-                        {
-                            normals.Add(vn);
-                            sawNormals = true;
-                        }
-                        continue;
-                    }
-
-                    if (!line.StartsWith("f ", StringComparison.Ordinal))
-                    {
-                        continue;
-                    }
-
-                    string[] faceElements = line.Substring(2).Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-                    if (faceElements.Length < 3) continue;
-
-                    int a = ResolveFaceVertex(faceElements[0], positions, texCoords, normals, outVertices, outTexCoords, outNormals, vertexCache);
-                    for (int f = 1; f < faceElements.Length - 1; f++)
-                    {
-                        int b = ResolveFaceVertex(faceElements[f], positions, texCoords, normals, outVertices, outTexCoords, outNormals, vertexCache);
-                        int c = ResolveFaceVertex(faceElements[f + 1], positions, texCoords, normals, outVertices, outTexCoords, outNormals, vertexCache);
-
-                        if (a < 0 || b < 0 || c < 0) continue;
-                        outTriangles.Add(a);
-                        outTriangles.Add(b);
-                        outTriangles.Add(c);
-                    }
+                    return Vector3.right;
                 }
 
-                if (outVertices.Count == 0 || outTriangles.Count == 0)
+                if (sharedHingeAxisWorld.HasValue && sharedHingeAxisWorld.Value.sqrMagnitude > 0.000001f)
                 {
-                    VRModCore.LogWarning($"[OpenXR][ControllerModel] OBJ has no valid mesh data: {filePath}");
-                    return null;
+                    Vector3 localSharedAxis = bone.InverseTransformDirection(sharedHingeAxisWorld.Value.normalized);
+                    return OrientAxisTowardPalm(bone, openRotation, localSharedAxis, sampleTip ?? child, palm);
                 }
 
-                var mesh = new Mesh
+                Vector3 fingerDirectionWorld;
+                if (child != null && (child.position - bone.position).sqrMagnitude > 0.000001f)
                 {
-                    name = meshName
-                };
-
-                if (outVertices.Count > 65535)
-                {
-                    mesh.indexFormat = IndexFormat.UInt32;
-                }
-
-                mesh.SetVertices(outVertices);
-                mesh.SetTriangles(outTriangles, 0, true);
-                if (outTexCoords.Count == outVertices.Count)
-                {
-                    mesh.SetUVs(0, outTexCoords);
-                }
-
-                if (sawNormals && outNormals.Count == outVertices.Count)
-                {
-                    mesh.SetNormals(outNormals);
+                    fingerDirectionWorld = (child.position - bone.position).normalized;
                 }
                 else
                 {
-                    mesh.RecalculateNormals();
+                    fingerDirectionWorld = bone.forward;
                 }
 
-                mesh.RecalculateBounds();
-                ApplyAutoScale(mesh, TargetControllerLongestAxisMeters);
-                return mesh;
-            }
-            catch (Exception ex)
-            {
-                VRModCore.LogWarning($"[OpenXR][ControllerModel] OBJ load exception for '{filePath}': {ex.Message}");
-                return null;
-            }
-        }
-
-        private static string TryResolveTexturePathFromObjAndMtl(string objPath, string[] objLines)
-        {
-            try
-            {
-                string objDir = Path.GetDirectoryName(objPath) ?? string.Empty;
-                var candidateMtlPaths = new List<string>();
-
-                for (int i = 0; i < objLines.Length; i++)
+                Vector3 palmDirectionWorld = palm.position - bone.position;
+                if (palmDirectionWorld.sqrMagnitude <= 0.000001f)
                 {
-                    string line = objLines[i];
-                    if (string.IsNullOrWhiteSpace(line)) continue;
-                    line = line.Trim();
-                    if (!line.StartsWith("mtllib ", StringComparison.OrdinalIgnoreCase)) continue;
-
-                    string mtllib = line.Substring(7).Trim().Trim('"');
-                    if (string.IsNullOrWhiteSpace(mtllib)) continue;
-
-                    string resolvedMtl = ResolveFilePath(mtllib, objDir, objDir);
-                    if (!string.IsNullOrWhiteSpace(resolvedMtl))
-                    {
-                        candidateMtlPaths.Add(resolvedMtl);
-                    }
+                    return Vector3.right;
                 }
 
-                string defaultMtl = Path.ChangeExtension(objPath, ".mtl");
-                if (File.Exists(defaultMtl))
+                palmDirectionWorld.Normalize();
+                Vector3 hingeAxisWorld = Vector3.Cross(fingerDirectionWorld, palmDirectionWorld);
+                if (hingeAxisWorld.sqrMagnitude <= 0.000001f)
                 {
-                    candidateMtlPaths.Add(defaultMtl);
+                    return Vector3.right;
                 }
 
-                for (int i = 0; i < candidateMtlPaths.Count; i++)
+                Vector3 localAxis = bone.InverseTransformDirection(hingeAxisWorld.normalized);
+                return OrientAxisTowardPalm(bone, openRotation, localAxis, sampleTip ?? child, palm);
+            }
+
+            private static Vector3 OrientAxisTowardPalm(Transform bone, Quaternion openRotation, Vector3 localAxis, Transform sampleTip, Transform palm)
+            {
+                if (bone == null || palm == null || sampleTip == null || localAxis.sqrMagnitude <= 0.000001f)
                 {
-                    string mtlPath = candidateMtlPaths[i];
-                    if (!File.Exists(mtlPath)) continue;
-
-                    string texturePath = TryResolveTexturePathFromMtl(mtlPath, objDir);
-                    if (!string.IsNullOrWhiteSpace(texturePath))
-                    {
-                        return texturePath;
-                    }
+                    return localAxis.sqrMagnitude > 0.000001f ? localAxis.normalized : Vector3.right;
                 }
-            }
-            catch
-            {
-            }
 
-            return null;
-        }
+                localAxis.Normalize();
+                Quaternion originalRotation = bone.localRotation;
+                float plusDistance;
+                float minusDistance;
 
-        private static string TryResolveTexturePathFromMtl(string mtlPath, string objDir)
-        {
-            string mtlDir = Path.GetDirectoryName(mtlPath) ?? objDir;
-            string[] mtlLines = File.ReadAllLines(mtlPath);
-            for (int i = 0; i < mtlLines.Length; i++)
-            {
-                string line = mtlLines[i];
-                if (string.IsNullOrWhiteSpace(line)) continue;
-                line = line.Trim();
-                if (!line.StartsWith("map_Kd ", StringComparison.OrdinalIgnoreCase)) continue;
-
-                string rawTextureRef = line.Substring(7).Trim().Trim('"');
-                string resolved = ResolveFilePath(rawTextureRef, mtlDir, objDir);
-                if (!string.IsNullOrWhiteSpace(resolved))
+                try
                 {
-                    return resolved;
+                    bone.localRotation = openRotation * Quaternion.AngleAxis(12f, localAxis);
+                    plusDistance = (sampleTip.position - palm.position).sqrMagnitude;
+
+                    bone.localRotation = openRotation * Quaternion.AngleAxis(-12f, localAxis);
+                    minusDistance = (sampleTip.position - palm.position).sqrMagnitude;
                 }
-            }
-
-            return null;
-        }
-
-        private static string ResolveFilePath(string fileRef, string primaryDir, string secondaryDir)
-        {
-            if (string.IsNullOrWhiteSpace(fileRef))
-            {
-                return null;
-            }
-
-            string normalized = fileRef.Trim().Trim('"').Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
-
-            if (Path.IsPathRooted(normalized) && File.Exists(normalized))
-            {
-                return normalized;
-            }
-
-            string primaryPath = Path.Combine(primaryDir ?? string.Empty, normalized);
-            if (File.Exists(primaryPath))
-            {
-                return primaryPath;
-            }
-
-            string secondaryPath = Path.Combine(secondaryDir ?? string.Empty, normalized);
-            if (File.Exists(secondaryPath))
-            {
-                return secondaryPath;
-            }
-
-            string fileNameOnly = Path.GetFileName(normalized);
-            if (!string.IsNullOrWhiteSpace(fileNameOnly))
-            {
-                string primaryNamePath = Path.Combine(primaryDir ?? string.Empty, fileNameOnly);
-                if (File.Exists(primaryNamePath))
+                finally
                 {
-                    return primaryNamePath;
+                    bone.localRotation = originalRotation;
                 }
 
-                string secondaryNamePath = Path.Combine(secondaryDir ?? string.Empty, fileNameOnly);
-                if (File.Exists(secondaryNamePath))
-                {
-                    return secondaryNamePath;
-                }
-            }
-
-            return null;
-        }
-
-        private static bool TryParseVector3(string line, NumberFormatInfo numberFormat, out Vector3 result)
-        {
-            result = Vector3.zero;
-            string[] parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 4) return false;
-            if (!float.TryParse(parts[1], NumberStyles.Float, numberFormat, out float x)) return false;
-            if (!float.TryParse(parts[2], NumberStyles.Float, numberFormat, out float y)) return false;
-            if (!float.TryParse(parts[3], NumberStyles.Float, numberFormat, out float z)) return false;
-            result = new Vector3(x, y, z);
-            return true;
-        }
-
-        private static bool TryParseVector2(string line, NumberFormatInfo numberFormat, out Vector2 result)
-        {
-            result = Vector2.zero;
-            string[] parts = line.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
-            if (parts.Length < 3) return false;
-            if (!float.TryParse(parts[1], NumberStyles.Float, numberFormat, out float x)) return false;
-            if (!float.TryParse(parts[2], NumberStyles.Float, numberFormat, out float y)) return false;
-            result = new Vector2(x, y);
-            return true;
-        }
-
-        private static int ResolveFaceVertex(
-            string token,
-            List<Vector3> positions,
-            List<Vector2> texCoords,
-            List<Vector3> normals,
-            List<Vector3> outVertices,
-            List<Vector2> outTexCoords,
-            List<Vector3> outNormals,
-            Dictionary<string, int> cache)
-        {
-            if (string.IsNullOrWhiteSpace(token))
-            {
-                return -1;
-            }
-
-            if (cache.TryGetValue(token, out int cached))
-            {
-                return cached;
-            }
-
-            string[] indices = token.Split('/');
-            int pIndex = ParseObjIndex(indices, 0, positions.Count);
-            if (pIndex < 0 || pIndex >= positions.Count)
-            {
-                return -1;
-            }
-
-            int tIndex = ParseObjIndex(indices, 1, texCoords.Count);
-            int nIndex = ParseObjIndex(indices, 2, normals.Count);
-
-            int outIndex = outVertices.Count;
-            outVertices.Add(positions[pIndex]);
-            outTexCoords.Add((tIndex >= 0 && tIndex < texCoords.Count) ? texCoords[tIndex] : Vector2.zero);
-            outNormals.Add((nIndex >= 0 && nIndex < normals.Count) ? normals[nIndex] : Vector3.zero);
-
-            cache[token] = outIndex;
-            return outIndex;
-        }
-
-        private static int ParseObjIndex(string[] elements, int elementIndex, int sourceCount)
-        {
-            if (elements == null || elementIndex >= elements.Length) return -1;
-            string raw = elements[elementIndex];
-            if (string.IsNullOrEmpty(raw)) return -1;
-
-            if (!int.TryParse(raw, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
-            {
-                return -1;
-            }
-
-            if (parsed > 0)
-            {
-                return parsed - 1;
-            }
-
-            if (parsed < 0)
-            {
-                return sourceCount + parsed;
-            }
-
-            return -1;
-        }
-
-        private static void ApplyAutoScale(Mesh mesh, float targetLongestAxisMeters)
-        {
-            if (mesh == null) return;
-            if (targetLongestAxisMeters <= 0f) return;
-
-            Bounds bounds = mesh.bounds;
-            float longest = Mathf.Max(bounds.size.x, Mathf.Max(bounds.size.y, bounds.size.z));
-            if (longest <= 0.0001f) return;
-
-            float scale = targetLongestAxisMeters / longest;
-            Vector3[] vertices = mesh.vertices;
-            for (int i = 0; i < vertices.Length; i++)
-            {
-                vertices[i] *= scale;
-            }
-
-            mesh.vertices = vertices;
-            mesh.RecalculateBounds();
-        }
-
-        private void SetVisible(bool leftVisible, bool rightVisible)
-        {
-            if (_leftControllerObject != null && _leftControllerObject.activeSelf != leftVisible)
-            {
-                _leftControllerObject.SetActive(leftVisible);
-            }
-
-            if (_rightControllerObject != null && _rightControllerObject.activeSelf != rightVisible)
-            {
-                _rightControllerObject.SetActive(rightVisible);
+                return minusDistance < plusDistance ? -localAxis : localAxis;
             }
         }
     }
 }
+#endif

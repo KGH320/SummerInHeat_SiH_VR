@@ -8,6 +8,7 @@ namespace UnityVRMod.Features.VrVisualization
     internal sealed class OpenXrMagicaClothHandColliders
     {
         private const float RefreshIntervalSeconds = 2.0f;
+        private const int HandColliderCount = OpenXrHandPoseModel.MaxColliderPoseCount;
         private static readonly Vector3 DisabledColliderPosition = new(0f, -10000f, 0f);
 
         private readonly List<System.Collections.IList> _patchedColliderLists = [];
@@ -34,10 +35,10 @@ namespace UnityVRMod.Features.VrVisualization
         private MethodInfo _colliderManagerUpdateParametersMethod;
         private bool _bindingsResolved;
 
-        private GameObject _leftColliderObject;
-        private GameObject _rightColliderObject;
-        private Component _leftCollider;
-        private Component _rightCollider;
+        private HandColliderSet _leftHandColliders;
+        private HandColliderSet _rightHandColliders;
+        private readonly OpenXrHandWorldColliderPose[] _leftPoseBuffer = new OpenXrHandWorldColliderPose[HandColliderCount];
+        private readonly OpenXrHandWorldColliderPose[] _rightPoseBuffer = new OpenXrHandWorldColliderPose[HandColliderCount];
         private float _nextRefreshTime;
         private string _lastSceneName = string.Empty;
         private bool _wasEnabled;
@@ -48,9 +49,13 @@ namespace UnityVRMod.Features.VrVisualization
             bool hasLeftHandPose,
             Vector3 leftHandWorldPos,
             Quaternion leftHandWorldRot,
+            float leftGripValue,
+            float leftTriggerValue,
             bool hasRightHandPose,
             Vector3 rightHandWorldPos,
-            Quaternion rightHandWorldRot)
+            Quaternion rightHandWorldRot,
+            float rightGripValue,
+            float rightTriggerValue)
         {
             if (!(ConfigManager.OpenXR_EnableMagicaClothHandColliders?.Value ?? false))
             {
@@ -72,12 +77,12 @@ namespace UnityVRMod.Features.VrVisualization
             if (!Mathf.Approximately(radius, _lastAppliedRadius))
             {
                 _lastAppliedRadius = radius;
-                ApplyColliderShape(_leftCollider, radius);
-                ApplyColliderShape(_rightCollider, radius);
+                ApplyColliderShapes(_leftHandColliders, radius);
+                ApplyColliderShapes(_rightHandColliders, radius);
             }
 
-            UpdateHandCollider(_leftColliderObject, hasLeftHandPose, leftHandWorldPos, leftHandWorldRot);
-            UpdateHandCollider(_rightColliderObject, hasRightHandPose, rightHandWorldPos, rightHandWorldRot);
+            UpdateHandColliders(_leftHandColliders, _leftPoseBuffer, isLeftHand: true, hasLeftHandPose, leftHandWorldPos, leftHandWorldRot, leftGripValue, leftTriggerValue);
+            UpdateHandColliders(_rightHandColliders, _rightPoseBuffer, isLeftHand: false, hasRightHandPose, rightHandWorldPos, rightHandWorldRot, rightGripValue, rightTriggerValue);
 
             string sceneName = SceneManager.GetActiveScene().name ?? string.Empty;
             if (!string.Equals(sceneName, _lastSceneName, StringComparison.Ordinal))
@@ -96,8 +101,8 @@ namespace UnityVRMod.Features.VrVisualization
         public void Reset()
         {
             RemovePatchedColliders();
-            DestroyHandCollider(ref _leftColliderObject, ref _leftCollider);
-            DestroyHandCollider(ref _rightColliderObject, ref _rightCollider);
+            DestroyHandColliders(ref _leftHandColliders);
+            DestroyHandColliders(ref _rightHandColliders);
             _nextRefreshTime = 0f;
             _lastSceneName = string.Empty;
             _wasEnabled = false;
@@ -183,23 +188,43 @@ namespace UnityVRMod.Features.VrVisualization
 
         private bool EnsureHandColliders()
         {
-            if (_leftCollider != null && _rightCollider != null)
+            if (_leftHandColliders != null && _leftHandColliders.IsValid && _rightHandColliders != null && _rightHandColliders.IsValid)
             {
                 return true;
             }
 
-            _leftCollider = CreateHandCollider("Left", out _leftColliderObject);
-            _rightCollider = CreateHandCollider("Right", out _rightColliderObject);
-            return _leftCollider != null && _rightCollider != null;
+            _leftHandColliders = CreateHandColliders("Left");
+            _rightHandColliders = CreateHandColliders("Right");
+            return _leftHandColliders != null && _leftHandColliders.IsValid && _rightHandColliders != null && _rightHandColliders.IsValid;
         }
 
-        private Component CreateHandCollider(string handName, out GameObject colliderObject)
+        private HandColliderSet CreateHandColliders(string handName)
         {
-            colliderObject = new GameObject($"UnityVRMod_OpenXR_MagicaClothHandCollider_{handName}");
-            UnityEngine.Object.DontDestroyOnLoad(colliderObject);
-            colliderObject.hideFlags = HideFlags.HideAndDontSave;
-            colliderObject.transform.position = DisabledColliderPosition;
-            return colliderObject.AddComponent(_magicaSphereColliderType);
+            var set = new HandColliderSet(HandColliderCount);
+            for (int i = 0; i < HandColliderCount; i++)
+            {
+                GameObject colliderObject = new GameObject($"UnityVRMod_OpenXR_MagicaClothHandCollider_{handName}_{i}");
+                UnityEngine.Object.DontDestroyOnLoad(colliderObject);
+                colliderObject.hideFlags = HideFlags.HideAndDontSave;
+                colliderObject.transform.position = DisabledColliderPosition;
+                set.Objects[i] = colliderObject;
+                set.Colliders[i] = colliderObject.AddComponent(_magicaSphereColliderType);
+            }
+
+            return set;
+        }
+
+        private void ApplyColliderShapes(HandColliderSet set, float radius)
+        {
+            if (set == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < set.Colliders.Length; i++)
+            {
+                ApplyColliderShape(set.Colliders[i], radius);
+            }
         }
 
         private void ApplyColliderShape(Component collider, float radius)
@@ -228,20 +253,51 @@ namespace UnityVRMod.Features.VrVisualization
             }
         }
 
-        private static void UpdateHandCollider(GameObject colliderObject, bool hasPose, Vector3 worldPos, Quaternion worldRot)
+        private void UpdateHandColliders(
+            HandColliderSet set,
+            OpenXrHandWorldColliderPose[] poseBuffer,
+            bool isLeftHand,
+            bool hasPose,
+            Vector3 worldPos,
+            Quaternion worldRot,
+            float gripValue,
+            float triggerValue)
         {
-            if (colliderObject == null)
+            if (set == null || poseBuffer == null)
             {
                 return;
             }
 
-            colliderObject.transform.position = hasPose ? worldPos : DisabledColliderPosition;
-            colliderObject.transform.rotation = hasPose ? worldRot : Quaternion.identity;
+            int poseCount = 0;
+            bool hasModelAnchors = hasPose && OpenXrHandModelAnchorRegistry.TryFillWorldColliderPoses(isLeftHand, poseBuffer, out poseCount);
+            for (int i = 0; i < set.Objects.Length; i++)
+            {
+                GameObject colliderObject = set.Objects[i];
+                Component collider = set.Colliders[i];
+                if (colliderObject == null || collider == null)
+                {
+                    continue;
+                }
+
+                if (hasModelAnchors && i < poseCount)
+                {
+                    OpenXrHandWorldColliderPose pose = poseBuffer[i];
+                    colliderObject.name = $"UnityVRMod_OpenXR_MagicaClothHandCollider_{(isLeftHand ? "Left" : "Right")}_{pose.Name}";
+                    colliderObject.transform.position = pose.WorldPosition;
+                    colliderObject.transform.rotation = pose.WorldRotation;
+                    ApplyColliderShape(collider, _lastAppliedRadius * pose.RadiusScale);
+                }
+                else
+                {
+                    colliderObject.transform.position = DisabledColliderPosition;
+                    colliderObject.transform.rotation = Quaternion.identity;
+                }
+            }
         }
 
         private void RefreshTargets()
         {
-            if (_leftCollider == null || _rightCollider == null)
+            if (_leftHandColliders == null || !_leftHandColliders.IsValid || _rightHandColliders == null || !_rightHandColliders.IsValid)
             {
                 return;
             }
@@ -279,8 +335,8 @@ namespace UnityVRMod.Features.VrVisualization
         private bool TryPatchMagicaCloth(Component magicaCloth)
         {
             bool patchedSerializedList = TryPatchSerializedColliderList(magicaCloth);
-            bool patchedRuntime = TryRegisterRuntimeCollider(magicaCloth, _leftCollider)
-                | TryRegisterRuntimeCollider(magicaCloth, _rightCollider);
+            bool patchedRuntime = TryRegisterRuntimeColliders(magicaCloth, _leftHandColliders)
+                | TryRegisterRuntimeColliders(magicaCloth, _rightHandColliders);
 
             return patchedSerializedList || patchedRuntime;
         }
@@ -300,8 +356,8 @@ namespace UnityVRMod.Features.VrVisualization
                 return false;
             }
 
-            AddColliderIfMissing(colliders, _leftCollider);
-            AddColliderIfMissing(colliders, _rightCollider);
+            AddCollidersIfMissing(colliders, _leftHandColliders);
+            AddCollidersIfMissing(colliders, _rightHandColliders);
 
             int listId = System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(colliders);
             if (_patchedListIds.Add(listId))
@@ -310,6 +366,22 @@ namespace UnityVRMod.Features.VrVisualization
             }
 
             return true;
+        }
+
+        private bool TryRegisterRuntimeColliders(Component magicaCloth, HandColliderSet set)
+        {
+            if (set == null)
+            {
+                return false;
+            }
+
+            bool registeredAny = false;
+            for (int i = 0; i < set.Colliders.Length; i++)
+            {
+                registeredAny |= TryRegisterRuntimeCollider(magicaCloth, set.Colliders[i]);
+            }
+
+            return registeredAny;
         }
 
         private bool TryRegisterRuntimeCollider(Component magicaCloth, Component collider)
@@ -411,8 +483,8 @@ namespace UnityVRMod.Features.VrVisualization
                     continue;
                 }
 
-                RemoveColliderIfPresent(colliders, _leftCollider);
-                RemoveColliderIfPresent(colliders, _rightCollider);
+                RemoveCollidersIfPresent(colliders, _leftHandColliders);
+                RemoveCollidersIfPresent(colliders, _rightHandColliders);
             }
 
             _patchedColliderLists.Clear();
@@ -429,6 +501,19 @@ namespace UnityVRMod.Features.VrVisualization
             colliders.Add(collider);
         }
 
+        private static void AddCollidersIfMissing(System.Collections.IList colliders, HandColliderSet set)
+        {
+            if (set == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < set.Colliders.Length; i++)
+            {
+                AddColliderIfMissing(colliders, set.Colliders[i]);
+            }
+        }
+
         private static void RemoveColliderIfPresent(System.Collections.IList colliders, Component collider)
         {
             if (colliders == null || collider == null)
@@ -442,14 +527,35 @@ namespace UnityVRMod.Features.VrVisualization
             }
         }
 
-        private static void DestroyHandCollider(ref GameObject colliderObject, ref Component collider)
+        private static void RemoveCollidersIfPresent(System.Collections.IList colliders, HandColliderSet set)
         {
-            collider = null;
-            if (colliderObject != null)
+            if (set == null)
             {
-                UnityEngine.Object.Destroy(colliderObject);
-                colliderObject = null;
+                return;
             }
+
+            for (int i = 0; i < set.Colliders.Length; i++)
+            {
+                RemoveColliderIfPresent(colliders, set.Colliders[i]);
+            }
+        }
+
+        private static void DestroyHandColliders(ref HandColliderSet set)
+        {
+            if (set == null)
+            {
+                return;
+            }
+
+            for (int i = 0; i < set.Objects.Length; i++)
+            {
+                if (set.Objects[i] != null)
+                {
+                    UnityEngine.Object.Destroy(set.Objects[i]);
+                }
+            }
+
+            set = null;
         }
 
         private static Type ResolveTypeAnyAssembly(string fullTypeName)
@@ -559,6 +665,39 @@ namespace UnityVRMod.Features.VrVisualization
             public string Id { get; }
             public int TeamId { get; }
             public Component Collider { get; }
+        }
+
+        private sealed class HandColliderSet
+        {
+            public HandColliderSet(int count)
+            {
+                Objects = new GameObject[count];
+                Colliders = new Component[count];
+            }
+
+            public GameObject[] Objects { get; }
+            public Component[] Colliders { get; }
+
+            public bool IsValid
+            {
+                get
+                {
+                    if (Objects == null || Colliders == null || Objects.Length == 0 || Objects.Length != Colliders.Length)
+                    {
+                        return false;
+                    }
+
+                    for (int i = 0; i < Objects.Length; i++)
+                    {
+                        if (Objects[i] == null || Colliders[i] == null)
+                        {
+                            return false;
+                        }
+                    }
+
+                    return true;
+                }
+            }
         }
     }
 }

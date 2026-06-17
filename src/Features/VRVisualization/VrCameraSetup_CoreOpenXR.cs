@@ -69,6 +69,7 @@ namespace UnityVRMod.Features.VrVisualization
         private readonly HashSet<string> _forceSolidClearSceneNames = new(StringComparer.OrdinalIgnoreCase);
         private string _cachedForceSolidClearScenesRaw = string.Empty;
         private const int VrRigRenderLayer = 31;
+        private const int OpenXrHandRenderLayer = 30;
         private static readonly Color VrRigClearColor = new(0.4623f, 0.4623f, 0.4623f, 0f);
         private static bool UseSingleSharedVrEyeCamera = true;
         private static bool EnableOpenXrPostFxSync = true;
@@ -1083,7 +1084,10 @@ namespace UnityVRMod.Features.VrVisualization
                 _vrUiOverlayCamera.targetTexture = currentIntermediateRT;
                 _vrUiOverlayCamera.enabled = true;
                 CopyVrCameraTransform(currentEyeCamera, _vrUiOverlayCamera);
+                originalInvertCulling = GL.invertCulling;
+                GL.invertCulling = true;
                 _vrUiOverlayCamera.Render();
+                GL.invertCulling = originalInvertCulling;
                 _vrUiOverlayCamera.enabled = false;
             }
 
@@ -1260,6 +1264,21 @@ namespace UnityVRMod.Features.VrVisualization
                 hasRightHandWorldPose = TryGetRightGripPoseWorldTransform(_xrFrameState.predictedDisplayTime, out rightHandWorldPos, out rightHandWorldRot);
             }
 
+            _controllerVisualizer.Update(
+                _vrRig,
+                OpenXrHandRenderLayer,
+                hasLeftHandWorldPose,
+                leftHandWorldPos,
+                leftHandWorldRot,
+                GetFloatActionValue(_leftGripLogState),
+                GetTriggerActionValue(_leftTriggerLogState),
+                hasRightHandWorldPose,
+                rightHandWorldPos,
+                rightHandWorldRot,
+                GetFloatActionValue(_rightGripLogState),
+                GetTriggerActionValue(_rightTriggerLogState),
+                activeControlHand);
+
 #if PHYSICS_LOG
             _physicsDiagnostics.Update(
                 hasLeftHandWorldPose,
@@ -1272,17 +1291,25 @@ namespace UnityVRMod.Features.VrVisualization
                 hasLeftHandWorldPose,
                 leftHandWorldPos,
                 leftHandWorldRot,
+                GetFloatActionValue(_leftGripLogState),
+                GetTriggerActionValue(_leftTriggerLogState),
                 hasRightHandWorldPose,
                 rightHandWorldPos,
-                rightHandWorldRot);
+                rightHandWorldRot,
+                GetFloatActionValue(_rightGripLogState),
+                GetTriggerActionValue(_rightTriggerLogState));
 
             _magicaClothHandColliders.Update(
                 hasLeftHandWorldPose,
                 leftHandWorldPos,
                 leftHandWorldRot,
+                GetFloatActionValue(_leftGripLogState),
+                GetTriggerActionValue(_leftTriggerLogState),
                 hasRightHandWorldPose,
                 rightHandWorldPos,
-                rightHandWorldRot);
+                rightHandWorldRot,
+                GetFloatActionValue(_rightGripLogState),
+                GetTriggerActionValue(_rightTriggerLogState));
 
             bool hasActiveHandWorldPose = useLeftControlHand ? hasLeftHandWorldPose : hasRightHandWorldPose;
             Vector3 activeHandWorldPos = useLeftControlHand ? leftHandWorldPos : rightHandWorldPos;
@@ -1419,7 +1446,6 @@ namespace UnityVRMod.Features.VrVisualization
             bool hasTeleportPointer = hasPointerPose && isTeleportAiming && !isGripHeld && !isPlaneEditTriggerConsumed;
             Vector3 cameraForwardWorld = currentMainCamera != null ? currentMainCamera.transform.forward : _vrRig.transform.forward;
 
-            _controllerVisualizer.Update(_vrRig, _vrRig.layer, hasLeftHandWorldPose, leftHandWorldPos, leftHandWorldRot, hasRightHandWorldPose, rightHandWorldPos, rightHandWorldRot, activeControlHand);
             _danmenProjectionPlane.Update(uiToggleShortPress, hasPanelPose, panelWorldPos, panelWorldRot, hasPointerPose, pointerOriginWorld, pointerDirectionWorld);
             bool locomotionTeleportConfirmPressed = teleportConfirmPressed && !isPlaneEditTriggerConsumed;
             _locomotion.Update(_vrRig, turnStickX, isSmoothTurnHeld, isGripHeld, hasGripLocalPose, activeGripLocalPos, isTeleportAiming, locomotionTeleportConfirmPressed, hasTeleportPointer, pointerOriginWorld, pointerDirectionWorld, cameraForwardWorld, hasHmdPose, hmdWorldPos, leftStickX, leftStickY);
@@ -2336,6 +2362,16 @@ namespace UnityVRMod.Features.VrVisualization
             return Mathf.Clamp01(state.Value);
         }
 
+        private static float GetTriggerActionValue(OpenXrTriggerLogState state)
+        {
+            if (!state.HasSample || !state.IsActive)
+            {
+                return 0f;
+            }
+
+            return Mathf.Clamp01(state.Value);
+        }
+
         private static float GetThumbstickX(OpenXrVector2LogState state)
         {
             if (!state.HasSample || !state.IsActive)
@@ -2596,7 +2632,7 @@ namespace UnityVRMod.Features.VrVisualization
                 vrCam.clearFlags = CameraClearFlags.SolidColor;
                 vrCam.backgroundColor = VrRigClearColor;
                 // 2D 合成模式：无场景内容，VR Camera 直接渲染 Layer 31 的 UI 投影面板
-                vrCam.cullingMask = GetVrRigLayerMask();
+                vrCam.cullingMask = GetVrRigLayerMask() | GetOpenXrHandLayerMask();
                 return;
             }
 
@@ -2604,8 +2640,8 @@ namespace UnityVRMod.Features.VrVisualization
             // 排除 Layer 31（由 Overlay Camera 单独渲染以确保 UI 始终在前）；
             // 如果 Overlay Camera 未创建（配置禁用），则 VR Camera 照常包含 Layer 31。
             int sceneCullingMask = _vrUiOverlayCamera != null
-                ? _mainCameraCullingMask & ~GetVrRigLayerMask()
-                : _mainCameraCullingMask | GetVrRigLayerMask();
+                ? (_mainCameraCullingMask & ~GetVrRigLayerMask()) | GetOpenXrHandLayerMask()
+                : _mainCameraCullingMask | GetVrRigLayerMask() | GetOpenXrHandLayerMask();
 
             if (_isUsingForcedDefaultRenderState)
             {
@@ -2754,6 +2790,11 @@ namespace UnityVRMod.Features.VrVisualization
         {
             if (_vrRig == null) return 0;
             return 1 << _vrRig.layer;
+        }
+
+        private static int GetOpenXrHandLayerMask()
+        {
+            return 1 << OpenXrHandRenderLayer;
         }
 
         private void UpdateInputStates()

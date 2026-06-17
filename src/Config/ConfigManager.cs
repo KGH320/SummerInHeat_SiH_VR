@@ -55,6 +55,11 @@ namespace UnityVRMod.Config
         public static ConfigElement<float> OpenXR_SmoothTurnDegreesPerSecond;
         public static ConfigElement<OpenXrControlHand> OpenXR_ControlHand;
         public static ConfigElement<bool> OpenXR_EnablePerfLogging;
+        public static ConfigElement<string> OpenXR_HandModelBundlePath;
+        public static ConfigElement<string> OpenXR_LeftHandModelName;
+        public static ConfigElement<string> OpenXR_RightHandModelName;
+        public static ConfigElement<float> OpenXR_HandModelScale;
+        public static ConfigElement<float> OpenXR_HandFingerCurlDegrees;
 #if PHYSICS_LOG
         public static ConfigElement<bool> OpenXR_EnablePhysicsDiagnostics;
         public static ConfigElement<float> OpenXR_PhysicsDiagnosticsRadius;
@@ -156,7 +161,7 @@ namespace UnityVRMod.Config
             DisableVrRigScenes = new ConfigElement<string>("Disable VR Rig Scenes",
                 "Skips VR rig creation in specific scenes. Format: 'SceneNameA;SceneNameB;'. Matching is done against SceneManager.GetActiveScene().name.",
                 "");
-            
+
             // --- Backend-Specific Stability Settings ---
 #if OPENVR_BUILD
             OpenVR_DisablePostFxSync = new ConfigElement<bool>("OpenVR Disable PostFX Sync",
@@ -222,6 +227,21 @@ namespace UnityVRMod.Config
 
             OpenXR_EnablePerfLogging = new ConfigElement<bool>("OpenXR Enable Perf Logging",
                 "[OpenXR ONLY] Enables periodic [Perf][OpenXR] timing logs for diagnosis.", false);
+
+            OpenXR_HandModelBundlePath = new ConfigElement<string>("OpenXR Hand Model AssetBundle Path",
+                "[OpenXR ONLY] Path to an AssetBundle containing rigged left/right hand prefabs. Relative paths are resolved from the plugin DLL folder. Default: OpenXRHandModels/openxr_hands.", @"OpenXRHandModels\openxr_hands");
+
+            OpenXR_LeftHandModelName = new ConfigElement<string>("OpenXR Left Hand Model Name",
+                "[OpenXR ONLY] AssetBundle prefab name for the left hand model.", "LeftHand");
+
+            OpenXR_RightHandModelName = new ConfigElement<string>("OpenXR Right Hand Model Name",
+                "[OpenXR ONLY] AssetBundle prefab name for the right hand model.", "RightHand");
+
+            OpenXR_HandModelScale = new ConfigElement<float>("OpenXR Hand Model Scale",
+                "[OpenXR ONLY] Scale multiplier applied to loaded hand prefabs.", 1.0f);
+
+            OpenXR_HandFingerCurlDegrees = new ConfigElement<float>("OpenXR Hand Finger Curl Degrees",
+                "[OpenXR ONLY] Additional local X rotation applied to resolved finger bones at full grip/trigger curl. Use a negative value if the model bends backward.", 90.0f);
 
 #if PHYSICS_LOG
             OpenXR_EnablePhysicsDiagnostics = new ConfigElement<bool>("OpenXR Enable Physics Diagnostics",
