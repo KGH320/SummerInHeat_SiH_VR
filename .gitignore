@@ -37,3 +37,6 @@ UnityGraphicsHelper.dll
 *.sig
 
 dnSpy/
+Directory.Build.props
+.vscode/settings.json
+src/packages.lock.json
