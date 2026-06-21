@@ -40,6 +40,7 @@ $NativeHelperDllBuildOutputBase = "UnityGraphicsHelper/x64"
 $NativeHelperDllName = "UnityGraphicsHelper.dll"
 $LibDir = "lib"
 $OpenXrHandModelsDir = "OpenXRHandModels"
+$OpenXrShadersDir = "OpenXRShaders"
 
 # --- Tooling checks ---
 if (-not (Get-Command dotnet -ErrorAction SilentlyContinue)) {
@@ -223,6 +224,13 @@ foreach ($currentTargetDef in $targetsToBuildActual) {
         } else {
             Write-Warning "OpenXR hand models directory not found: $OpenXrHandModelsSource"
         }
+        $OpenXrShadersSource = Join-Path $PSScriptRoot $OpenXrShadersDir
+        if (Test-Path $OpenXrShadersSource) {
+            Copy-Item -Path $OpenXrShadersSource -Destination $FinalPluginSubDir -Recurse -Force
+            Write-Host "  Copied OpenXR shaders to plugin output."
+        } else {
+            Write-Warning "OpenXR shaders directory not found: $OpenXrShadersSource"
+        }
     }
 
     Write-Host "  $($currentTargetDef.TargetRuntimeName) build for $VrBackend complete. Output: $FinalPluginSubDir"
@@ -272,6 +280,13 @@ if ($Deploy) {
             Write-Host "Deployed OpenXR hand models: $SourceHandModelsDir -> $DestDir"
         } else {
             Write-Warning "OpenXR hand models directory not found: $SourceHandModelsDir"
+        }
+        $SourceShadersDir = Join-Path $PSScriptRoot $OpenXrShadersDir
+        if (Test-Path $SourceShadersDir) {
+            Copy-Item -Path $SourceShadersDir -Destination $DestDir -Recurse -Force
+            Write-Host "Deployed OpenXR shaders: $SourceShadersDir -> $DestDir"
+        } else {
+            Write-Warning "OpenXR shaders directory not found: $SourceShadersDir"
         }
     }
 }

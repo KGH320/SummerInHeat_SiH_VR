@@ -258,6 +258,19 @@ namespace UnityVRMod.Features.VrVisualization
             }
         }
 
+#if OPENXR_BUILD
+        public void ToggleOpenXrPassthroughMode()
+        {
+            if (_cameraSetup is VrCameraSetup_CoreOpenXR openXrCameraSetup)
+            {
+                openXrCameraSetup.TogglePassthroughMode();
+                return;
+            }
+
+            VRModCore.LogWarning("[OpenXR] Cannot toggle passthrough because the OpenXR camera setup is not active.");
+        }
+#endif
+
         internal void Update()
         {
             if (_cameraSetup == null && _hasVrBeenAttemptedByUser)

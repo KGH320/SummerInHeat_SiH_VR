@@ -22,6 +22,21 @@ namespace UnityVRMod.Core
                 }
             }
 
+#if OPENXR_BUILD
+            if (ConfigManager.OpenXR_TogglePassthroughKey != null && InputManager.GetKeyDown(ConfigManager.OpenXR_TogglePassthroughKey.Value))
+            {
+                VRModCore.LogRuntimeDebug("Toggle OpenXR passthrough key pressed!");
+                if (VRModCore.VrVisualizationFeature != null)
+                {
+                    VRModCore.VrVisualizationFeature.ToggleOpenXrPassthroughMode();
+                }
+                else
+                {
+                    VRModCore.LogWarning("VrVisualizationManager (VrVisFeature) is null. Cannot toggle OpenXR passthrough.");
+                }
+            }
+#endif
+
             // REMINDER: Add other mod-specific keybind checks here if needed in the future.
         }
     }

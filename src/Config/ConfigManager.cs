@@ -71,6 +71,9 @@ namespace UnityVRMod.Config
         public static ConfigElement<float> OpenXR_MagicaClothHandColliderRadius;
         public static ConfigElement<string> OpenXR_ForceDefaultRenderScenes;
         public static ConfigElement<string> OpenXR_ForceSolidClearScenes;
+        public static ConfigElement<KeyCode> OpenXR_TogglePassthroughKey;
+        public static ConfigElement<string> OpenXR_PassthroughBackgroundColor;
+        public static ConfigElement<string> OpenXR_PassthroughAlphaFixShaderBundlePath;
 #endif
 
         // --- General Settings ---
@@ -271,6 +274,15 @@ namespace UnityVRMod.Config
 
             OpenXR_ForceSolidClearScenes = new ConfigElement<string>("OpenXR Force Solid Clear Scenes",
                 "[OpenXR ONLY] Keeps main-camera reference and PostFX sync, but forces VR eye-camera clearFlags to SolidColor in specific scenes. Useful when main camera uses ClearFlags=Nothing and causes ghosting/overexposure in VR. Format: 'SceneNameA;SceneNameB;'.", "");
+
+            OpenXR_TogglePassthroughKey = new ConfigElement<KeyCode>("OpenXR Toggle Passthrough Keybind",
+                "[OpenXR ONLY] Toggles Meta XR_FB_passthrough and the passthrough background color at runtime. If XR_FB_passthrough is unavailable, only toggles the background color.", KeyCode.F9);
+
+            OpenXR_PassthroughBackgroundColor = new ConfigElement<string>("OpenXR Passthrough Background Color",
+                "[OpenXR ONLY] Solid background color used by the passthrough alpha-fix shader and applied to the original game main camera while passthrough background mode is toggled on. Format: 'R G B A' or 'R,G,B,A'.", "0 0 0 255");
+
+            OpenXR_PassthroughAlphaFixShaderBundlePath = new ConfigElement<string>("OpenXR Passthrough Alpha Fix Shader Bundle Path",
+                "[OpenXR ONLY] AssetBundle path for shader 'Hidden/UnityVRMod/PassthroughAlphaFix'. Relative paths are resolved from the plugin DLL folder.", @"OpenXRShaders\passthrough_alpha_fix");
 #endif
 
             // --- General Settings ---

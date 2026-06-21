@@ -115,15 +115,19 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
         XR_TYPE_GRAPHICS_BINDING_D3D11_KHR = 1000027000,
         XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR = 1000027001,
         XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR = 1000027002,
+        XR_TYPE_PASSTHROUGH_CREATE_INFO_FB = 1000118001,
+        XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB = 1000118002,
+        XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB = 1000118003,
     }
 
     public enum XrFormFactor { XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY = 1 }
-    public enum XrEnvironmentBlendMode { XR_ENVIRONMENT_BLEND_MODE_OPAQUE = 1, XR_ENVIRONMENT_BLEND_MODE_ADDITIVE = 2, XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND = 3 }
+    public enum XrEnvironmentBlendMode { XR_ENVIRONMENT_BLEND_MODE_OPAQUE = 1 }
     public enum D3D_FEATURE_LEVEL { D3D_FEATURE_LEVEL_11_0 = 0xb000, D3D_FEATURE_LEVEL_11_1 = 0xb100 }
     public enum XrViewConfigurationType { XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO = 2 }
     public enum XrSessionState { XR_SESSION_STATE_UNKNOWN = 0, XR_SESSION_STATE_IDLE = 1, XR_SESSION_STATE_READY = 2, XR_SESSION_STATE_SYNCHRONIZED = 3, XR_SESSION_STATE_VISIBLE = 4, XR_SESSION_STATE_FOCUSED = 5, XR_SESSION_STATE_STOPPING = 6, XR_SESSION_STATE_LOSS_PENDING = 7, XR_SESSION_STATE_EXITING = 8 }
     public enum XrReferenceSpaceType { XR_REFERENCE_SPACE_TYPE_VIEW = 1, XR_REFERENCE_SPACE_TYPE_LOCAL = 2, XR_REFERENCE_SPACE_TYPE_STAGE = 3 }
     public enum XrActionType { XR_ACTION_TYPE_BOOLEAN_INPUT = 1, XR_ACTION_TYPE_FLOAT_INPUT = 2, XR_ACTION_TYPE_VECTOR2F_INPUT = 3, XR_ACTION_TYPE_POSE_INPUT = 4, XR_ACTION_TYPE_VIBRATION_OUTPUT = 100 }
+    public enum XrPassthroughLayerPurposeFB { XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB = 0, XR_PASSTHROUGH_LAYER_PURPOSE_PROJECTED_FB = 1 }
     [Flags] public enum XrSwapchainCreateFlags : ulong { None = 0 }
     [Flags] public enum XrSwapchainUsageFlags : ulong { XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT = 1, XR_SWAPCHAIN_USAGE_SAMPLED_BIT = 32 }
     [Flags] public enum XrViewStateFlags : ulong { XR_VIEW_STATE_ORIENTATION_VALID_BIT = 1, XR_VIEW_STATE_POSITION_VALID_BIT = 2 }
@@ -163,6 +167,7 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
         public static ulong XR_API_VERSION_1_0 = (1UL << 48);
         public static ulong XR_API_VERSION_1_1 = (1UL << 48) | (1UL << 32);
         public const string XR_KHR_D3D11_ENABLE_EXTENSION_NAME = "XR_KHR_D3D11_enable";
+        public const string XR_FB_PASSTHROUGH_EXTENSION_NAME = "XR_FB_passthrough";
     }
     public static class XrBool32 { public const uint XR_FALSE = 0; public const uint XR_TRUE = 1; }
     #endregion
@@ -210,6 +215,14 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrEndSession(ulong session);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrApplyHapticFeedback(ulong session, in XrHapticActionInfo hapticActionInfo, in XrHapticVibration hapticFeedback);
     [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrStopHapticFeedback(ulong session, in XrHapticActionInfo hapticActionInfo);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrCreatePassthroughFB(ulong session, in XrPassthroughCreateInfoFB createInfo, out ulong passthrough);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrDestroyPassthroughFB(ulong passthrough);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrPassthroughStartFB(ulong passthrough);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrPassthroughPauseFB(ulong passthrough);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrCreatePassthroughLayerFB(ulong session, in XrPassthroughLayerCreateInfoFB createInfo, out ulong layer);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrDestroyPassthroughLayerFB(ulong layer);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrPassthroughLayerPauseFB(ulong layer);
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)] public delegate XrResult PFN_xrPassthroughLayerResumeFB(ulong layer);
     #endregion
 
     #region --- Native Loader ---
@@ -311,6 +324,14 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
         public static PFN_xrEndSession xrEndSession;
         public static PFN_xrApplyHapticFeedback xrApplyHapticFeedback;
         public static PFN_xrStopHapticFeedback xrStopHapticFeedback;
+        public static PFN_xrCreatePassthroughFB xrCreatePassthroughFB;
+        public static PFN_xrDestroyPassthroughFB xrDestroyPassthroughFB;
+        public static PFN_xrPassthroughStartFB xrPassthroughStartFB;
+        public static PFN_xrPassthroughPauseFB xrPassthroughPauseFB;
+        public static PFN_xrCreatePassthroughLayerFB xrCreatePassthroughLayerFB;
+        public static PFN_xrDestroyPassthroughLayerFB xrDestroyPassthroughLayerFB;
+        public static PFN_xrPassthroughLayerPauseFB xrPassthroughLayerPauseFB;
+        public static PFN_xrPassthroughLayerResumeFB xrPassthroughLayerResumeFB;
 
         public static bool InitializeCoreFunctions(PFN_xrGetInstanceProcAddr getInstanceProcAddrEntry)
         {
@@ -364,6 +385,14 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
                 xrEndSession = GetXrFunction<PFN_xrEndSession>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
                 xrApplyHapticFeedback = GetXrFunction<PFN_xrApplyHapticFeedback>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
                 xrStopHapticFeedback = GetXrFunction<PFN_xrStopHapticFeedback>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
+                xrCreatePassthroughFB = TryGetXrFunction<PFN_xrCreatePassthroughFB>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
+                xrDestroyPassthroughFB = TryGetXrFunction<PFN_xrDestroyPassthroughFB>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
+                xrPassthroughStartFB = TryGetXrFunction<PFN_xrPassthroughStartFB>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
+                xrPassthroughPauseFB = TryGetXrFunction<PFN_xrPassthroughPauseFB>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
+                xrCreatePassthroughLayerFB = TryGetXrFunction<PFN_xrCreatePassthroughLayerFB>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
+                xrDestroyPassthroughLayerFB = TryGetXrFunction<PFN_xrDestroyPassthroughLayerFB>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
+                xrPassthroughLayerPauseFB = TryGetXrFunction<PFN_xrPassthroughLayerPauseFB>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
+                xrPassthroughLayerResumeFB = TryGetXrFunction<PFN_xrPassthroughLayerResumeFB>(instanceHandle, xrGetInstanceProcAddr_func_ptr);
                 return true;
             }
             catch (Exception ex)
@@ -379,6 +408,19 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
             XrResult result = getInstanceProcAddrFunc(instanceHandle, functionName, out IntPtr funcPtr);
             if (result != XrResult.XR_SUCCESS || funcPtr == IntPtr.Zero)
                 throw new EntryPointNotFoundException($"Failed to load OpenXR function '{functionName}'. Result: {result}");
+            return Marshal.GetDelegateForFunctionPointer<TDelegate>(funcPtr);
+        }
+
+        private static TDelegate TryGetXrFunction<TDelegate>(ulong instanceHandle, PFN_xrGetInstanceProcAddr getInstanceProcAddrFunc) where TDelegate : Delegate
+        {
+            string functionName = typeof(TDelegate).Name.Substring("PFN_".Length);
+            XrResult result = getInstanceProcAddrFunc(instanceHandle, functionName, out IntPtr funcPtr);
+            if (result != XrResult.XR_SUCCESS || funcPtr == IntPtr.Zero)
+            {
+                VRModCore.LogRuntimeDebug($"Optional OpenXR function '{functionName}' unavailable. Result: {result}");
+                return null;
+            }
+
             return Marshal.GetDelegateForFunctionPointer<TDelegate>(funcPtr);
         }
     }
@@ -485,6 +527,9 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
     [StructLayout(LayoutKind.Sequential)] public struct XrSwapchainSubImage { public ulong swapchain; public XrRect2Di imageRect; public uint imageArrayIndex; }
     [StructLayout(LayoutKind.Sequential)] public struct XrCompositionLayerProjectionView { public XrStructureType type; public IntPtr next; public XrPosef pose; public XrFovf fov; public XrSwapchainSubImage subImage; }
     [StructLayout(LayoutKind.Sequential)] public struct XrCompositionLayerProjection { public XrStructureType type; public IntPtr next; public XrCompositionLayerFlags layerFlags; public ulong space; public uint viewCount; public IntPtr views; }
+    [StructLayout(LayoutKind.Sequential)] public struct XrPassthroughCreateInfoFB { public XrStructureType type; public IntPtr next; public ulong flags; }
+    [StructLayout(LayoutKind.Sequential)] public struct XrPassthroughLayerCreateInfoFB { public XrStructureType type; public IntPtr next; public ulong passthrough; public ulong flags; public XrPassthroughLayerPurposeFB purpose; }
+    [StructLayout(LayoutKind.Sequential)] public struct XrCompositionLayerPassthroughFB { public XrStructureType type; public IntPtr next; public XrCompositionLayerFlags layerFlags; public ulong space; public ulong layerHandle; }
     [StructLayout(LayoutKind.Sequential)] public struct XrFrameEndInfo { public XrStructureType type; public IntPtr next; public long displayTime; public XrEnvironmentBlendMode environmentBlendMode; public uint layerCount; public IntPtr layers; }
     [StructLayout(LayoutKind.Sequential)] public struct XrSwapchainImageAcquireInfo { public XrStructureType type; public IntPtr next; }
     [StructLayout(LayoutKind.Sequential)] public struct XrSwapchainImageWaitInfo { public XrStructureType type; public IntPtr next; public long timeout; }

@@ -5,6 +5,7 @@ using UnityVRMod.Config;
 using UnityVRMod.Core;
 using UnityVRMod.Features.Util;
 using UnityVRMod.Features.VRVisualization.OpenXR;
+using System;
 using System.Text;
 
 namespace UnityVRMod.Features.VrVisualization
@@ -49,6 +50,13 @@ namespace UnityVRMod.Features.VrVisualization
 
         private RenderTexture _leftEyeIntermediateRT = null;
         private RenderTexture _rightEyeIntermediateRT = null;
+        private RenderTexture _leftEyePassthroughAlphaFixedRT = null;
+        private RenderTexture _rightEyePassthroughAlphaFixedRT = null;
+        private Material _passthroughAlphaFixMaterial;
+        private object _passthroughAlphaFixAssetBundle;
+        private MethodInfo _passthroughAlphaFixAssetBundleUnloadMethod;
+        private bool _hasLoggedPassthroughAlphaFixReady;
+        private bool _hasLoggedPassthroughAlphaFixUnavailable;
 
         private IntPtr _d3d11Device = IntPtr.Zero;
 
@@ -64,6 +72,21 @@ namespace UnityVRMod.Features.VrVisualization
         private bool _isUsing2dSyntheticFallbackCamera;
         private bool _isUsingForcedDefaultRenderState;
         private bool _isUsingForcedSolidClearState;
+        private bool _isFbPassthroughExtensionAvailable;
+        private bool _isFbPassthroughInitialized;
+        private bool _isFbPassthroughEnabled;
+        private ulong _fbPassthrough = OpenXRConstants.XR_NULL_HANDLE;
+        private ulong _fbPassthroughLayer = OpenXRConstants.XR_NULL_HANDLE;
+        private XrCompositionLayerPassthroughFB _fbPassthroughCompositionLayer;
+        private IntPtr _pFbPassthroughCompositionLayer = IntPtr.Zero;
+        private Camera _passthroughManagedCamera;
+        private CameraClearFlags _passthroughManagedOriginalClearFlags;
+        private Color _passthroughManagedOriginalBackgroundColor;
+        private bool _hasPassthroughManagedOriginalState;
+        private bool _isPassthroughBackgroundColorEnabled;
+        private string _cachedPassthroughBackgroundColorRaw = string.Empty;
+        private Color _cachedPassthroughBackgroundColor = new Color32(0, 0, 0, 255);
+        private bool _hasLoggedInvalidPassthroughBackgroundColor;
         private readonly HashSet<string> _forceDefaultRenderSceneNames = new(StringComparer.OrdinalIgnoreCase);
         private string _cachedForceDefaultRenderScenesRaw = string.Empty;
         private readonly HashSet<string> _forceSolidClearSceneNames = new(StringComparer.OrdinalIgnoreCase);
@@ -74,6 +97,8 @@ namespace UnityVRMod.Features.VrVisualization
         private static bool UseSingleSharedVrEyeCamera = true;
         private static bool EnableOpenXrPostFxSync = true;
         private const float OpenXrPerfLogIntervalSeconds = 1.0f;
+        private const float PassthroughKeyColorThreshold = 0.01f;
+        private const string PassthroughAlphaFixShaderName = "Hidden/UnityVRMod/PassthroughAlphaFix";
 
         private GameObject _currentlyTrackedOriginalCameraGO = null;
         private float _lastCalculatedVerticalOffset;
@@ -247,7 +272,17 @@ namespace UnityVRMod.Features.VrVisualization
                 if (!OpenXRAPI.InitializeCoreFunctions(OpenXRNativeLoader.xrGetInstanceProcAddr_ptr_delegate))
                     throw new Exception("Failed to initialize core OpenXR functions.");
 
-                string[] requestedExtensions = [OpenXRConstants.XR_KHR_D3D11_ENABLE_EXTENSION_NAME];
+                HashSet<string> availableExtensions = LogOpenXrPassthroughExtensionSupport();
+                _isFbPassthroughExtensionAvailable = availableExtensions.Contains(OpenXRConstants.XR_FB_PASSTHROUGH_EXTENSION_NAME);
+
+                var requestedExtensionList = new List<string> { OpenXRConstants.XR_KHR_D3D11_ENABLE_EXTENSION_NAME };
+                if (_isFbPassthroughExtensionAvailable)
+                {
+                    requestedExtensionList.Add(OpenXRConstants.XR_FB_PASSTHROUGH_EXTENSION_NAME);
+                    VRModCore.Log("[OpenXR] Requesting XR_FB_passthrough extension.");
+                }
+
+                string[] requestedExtensions = requestedExtensionList.ToArray();
                 IntPtr pRequestedExtensions = MarshallStringUtils.MarshalStringArrayToAnsi(requestedExtensions);
 
                 // Try API 1.1 first, fall back to 1.0 for runtimes like VDXR
@@ -346,7 +381,8 @@ namespace UnityVRMod.Features.VrVisualization
                     _pProjectionLayerViews = Marshal.AllocHGlobal(Marshal.SizeOf<XrCompositionLayerProjectionView>() * _viewConfigViews.Count);
                     _projectionLayer = new XrCompositionLayerProjection { type = XrStructureType.XR_TYPE_COMPOSITION_LAYER_PROJECTION };
                     _pProjectionLayer = Marshal.AllocHGlobal(Marshal.SizeOf<XrCompositionLayerProjection>());
-                    _pLayersForSubmit = Marshal.AllocHGlobal(Marshal.SizeOf<IntPtr>());
+                    _pFbPassthroughCompositionLayer = Marshal.AllocHGlobal(Marshal.SizeOf<XrCompositionLayerPassthroughFB>());
+                    _pLayersForSubmit = Marshal.AllocHGlobal(Marshal.SizeOf<IntPtr>() * 2);
                     Marshal.WriteIntPtr(_pLayersForSubmit, IntPtr.Zero);
                 }
 
@@ -365,6 +401,89 @@ namespace UnityVRMod.Features.VrVisualization
                 TeardownVr();
                 return false;
             }
+        }
+
+        private static HashSet<string> LogOpenXrPassthroughExtensionSupport()
+        {
+            string[] targetExtensions =
+            [
+                "XR_FB_passthrough",
+                "XR_FB_composition_layer_alpha_blend",
+                "XR_META_passthrough_preferences",
+                "XR_META_passthrough_color_lut"
+            ];
+
+            XrResult countResult = OpenXRAPI.xrEnumerateInstanceExtensionProperties(null, 0, out uint extensionCount, IntPtr.Zero);
+            if (countResult < 0)
+            {
+                VRModCore.LogWarning($"[OpenXR] Failed to enumerate instance extension count: {countResult}.");
+                foreach (string extensionName in targetExtensions)
+                {
+                    VRModCore.Log($"[OpenXR] Passthrough extension support: {extensionName}=False, Reason=enumerate-count-failed.");
+                }
+                return new HashSet<string>(StringComparer.Ordinal);
+            }
+
+            IntPtr extensionsPtr = IntPtr.Zero;
+            var availableExtensions = new HashSet<string>(StringComparer.Ordinal);
+            try
+            {
+                int extensionSize = Marshal.SizeOf<XrExtensionProperties>();
+                extensionsPtr = Marshal.AllocHGlobal((int)extensionCount * extensionSize);
+                for (int i = 0; i < extensionCount; i++)
+                {
+                    Marshal.StructureToPtr(
+                        new XrExtensionProperties { type = XrStructureType.XR_TYPE_EXTENSION_PROPERTIES },
+                        extensionsPtr + (i * extensionSize),
+                        false);
+                }
+
+                XrResult enumerateResult = OpenXRAPI.xrEnumerateInstanceExtensionProperties(null, extensionCount, out extensionCount, extensionsPtr);
+                if (enumerateResult < 0)
+                {
+                    VRModCore.LogWarning($"[OpenXR] Failed to enumerate instance extension values: {enumerateResult}.");
+                    foreach (string extensionName in targetExtensions)
+                    {
+                        VRModCore.Log($"[OpenXR] Passthrough extension support: {extensionName}=False, Reason=enumerate-values-failed.");
+                    }
+                    return availableExtensions;
+                }
+
+                for (int i = 0; i < extensionCount; i++)
+                {
+                    var extension = Marshal.PtrToStructure<XrExtensionProperties>(extensionsPtr + (i * extensionSize));
+                    if (!string.IsNullOrEmpty(extension.extensionName))
+                    {
+                        availableExtensions.Add(extension.extensionName);
+                    }
+                }
+            }
+            finally
+            {
+                if (extensionsPtr != IntPtr.Zero)
+                {
+                    Marshal.FreeHGlobal(extensionsPtr);
+                }
+            }
+
+            var summary = new StringBuilder();
+            for (int i = 0; i < targetExtensions.Length; i++)
+            {
+                string extensionName = targetExtensions[i];
+                bool supported = availableExtensions.Contains(extensionName);
+                if (i > 0) summary.Append(", ");
+                summary.Append(extensionName);
+                summary.Append('=');
+                summary.Append(supported);
+            }
+
+            VRModCore.Log($"[OpenXR] Passthrough extensions: Count={availableExtensions.Count}, {summary}.");
+            foreach (string extensionName in targetExtensions)
+            {
+                VRModCore.Log($"[OpenXR] Passthrough extension support: {extensionName}={availableExtensions.Contains(extensionName)}.");
+            }
+
+            return availableExtensions;
         }
 
         private void InitializeInputActions()
@@ -769,6 +888,246 @@ namespace UnityVRMod.Features.VrVisualization
             VRModCore.LogRuntimeDebug("View configurations enumerated.");
         }
 
+        public void TogglePassthroughMode()
+        {
+            if (!_isFbPassthroughExtensionAvailable)
+            {
+                _isFbPassthroughEnabled = false;
+                _isPassthroughBackgroundColorEnabled = !_isPassthroughBackgroundColorEnabled;
+                ApplyPassthroughBackgroundToGameCamera(GetTrackedMainCamera());
+                VRModCore.LogWarning($"[OpenXR] XR_FB_passthrough is not available. Passthrough background color toggled {(_isPassthroughBackgroundColorEnabled ? "ON" : "OFF")}.");
+                return;
+            }
+
+            if (!_isFbPassthroughEnabled && !EnsureFbPassthroughInitialized())
+            {
+                _isPassthroughBackgroundColorEnabled = !_isPassthroughBackgroundColorEnabled;
+                ApplyPassthroughBackgroundToGameCamera(GetTrackedMainCamera());
+                VRModCore.LogWarning($"[OpenXR] XR_FB_passthrough toggle failed during initialization. Passthrough background color toggled {(_isPassthroughBackgroundColorEnabled ? "ON" : "OFF")}.");
+                return;
+            }
+
+            _isFbPassthroughEnabled = !_isFbPassthroughEnabled;
+            SetFbPassthroughRuntimeState(_isFbPassthroughEnabled);
+            _isPassthroughBackgroundColorEnabled = _isFbPassthroughEnabled;
+            ApplyPassthroughBackgroundToGameCamera(GetTrackedMainCamera());
+            VRModCore.Log($"[OpenXR] XR_FB_passthrough toggled {(_isFbPassthroughEnabled ? "ON" : "OFF")}; passthrough background color toggled {(_isPassthroughBackgroundColorEnabled ? "ON" : "OFF")}.");
+        }
+
+        private bool IsFbPassthroughActive()
+        {
+            return _isFbPassthroughExtensionAvailable &&
+                   _isFbPassthroughInitialized &&
+                   _isFbPassthroughEnabled &&
+                   _fbPassthrough != OpenXRConstants.XR_NULL_HANDLE &&
+                   _fbPassthroughLayer != OpenXRConstants.XR_NULL_HANDLE;
+        }
+
+        private bool EnsureFbPassthroughInitialized()
+        {
+            if (_isFbPassthroughInitialized)
+            {
+                return _fbPassthrough != OpenXRConstants.XR_NULL_HANDLE &&
+                       _fbPassthroughLayer != OpenXRConstants.XR_NULL_HANDLE;
+            }
+
+            if (OpenXRAPI.xrCreatePassthroughFB == null ||
+                OpenXRAPI.xrCreatePassthroughLayerFB == null ||
+                OpenXRAPI.xrPassthroughStartFB == null ||
+                OpenXRAPI.xrPassthroughPauseFB == null ||
+                OpenXRAPI.xrPassthroughLayerResumeFB == null ||
+                OpenXRAPI.xrPassthroughLayerPauseFB == null)
+            {
+                VRModCore.LogWarning("[OpenXR] XR_FB_passthrough extension is available, but one or more required passthrough functions are missing.");
+                _isFbPassthroughInitialized = true;
+                return false;
+            }
+
+            var passthroughCreateInfo = new XrPassthroughCreateInfoFB
+            {
+                type = XrStructureType.XR_TYPE_PASSTHROUGH_CREATE_INFO_FB
+            };
+            XrResult passthroughResult = OpenXRAPI.xrCreatePassthroughFB(_xrSession, in passthroughCreateInfo, out _fbPassthrough);
+            if (passthroughResult < 0 || _fbPassthrough == OpenXRConstants.XR_NULL_HANDLE)
+            {
+                VRModCore.LogWarning($"[OpenXR] xrCreatePassthroughFB failed: {passthroughResult}.");
+                _isFbPassthroughInitialized = true;
+                return false;
+            }
+
+            var layerCreateInfo = new XrPassthroughLayerCreateInfoFB
+            {
+                type = XrStructureType.XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB,
+                passthrough = _fbPassthrough,
+                purpose = XrPassthroughLayerPurposeFB.XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB
+            };
+            XrResult layerResult = OpenXRAPI.xrCreatePassthroughLayerFB(_xrSession, in layerCreateInfo, out _fbPassthroughLayer);
+            if (layerResult < 0 || _fbPassthroughLayer == OpenXRConstants.XR_NULL_HANDLE)
+            {
+                VRModCore.LogWarning($"[OpenXR] xrCreatePassthroughLayerFB failed: {layerResult}.");
+                DestroyFbPassthrough();
+                _isFbPassthroughInitialized = true;
+                return false;
+            }
+
+            _fbPassthroughCompositionLayer = new XrCompositionLayerPassthroughFB
+            {
+                type = XrStructureType.XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB,
+                layerFlags = XrCompositionLayerFlags.None,
+                // XR_FB_passthrough requires XrCompositionLayerPassthroughFB.space to be XR_NULL_HANDLE.
+                space = OpenXRConstants.XR_NULL_HANDLE,
+                layerHandle = _fbPassthroughLayer
+            };
+            _isFbPassthroughInitialized = true;
+            VRModCore.Log("[OpenXR] XR_FB_passthrough feature and reconstruction layer created.");
+            return true;
+        }
+
+        private void SetFbPassthroughRuntimeState(bool enabled)
+        {
+            if (_fbPassthrough == OpenXRConstants.XR_NULL_HANDLE ||
+                _fbPassthroughLayer == OpenXRConstants.XR_NULL_HANDLE)
+            {
+                return;
+            }
+
+            XrResult featureResult = enabled
+                ? OpenXRAPI.xrPassthroughStartFB(_fbPassthrough)
+                : OpenXRAPI.xrPassthroughPauseFB(_fbPassthrough);
+            XrResult layerResult = enabled
+                ? OpenXRAPI.xrPassthroughLayerResumeFB(_fbPassthroughLayer)
+                : OpenXRAPI.xrPassthroughLayerPauseFB(_fbPassthroughLayer);
+
+            if (featureResult < 0 || layerResult < 0)
+            {
+                VRModCore.LogWarning($"[OpenXR] XR_FB_passthrough {(enabled ? "enable" : "disable")} returned feature={featureResult}, layer={layerResult}.");
+            }
+        }
+
+        private void DestroyFbPassthrough()
+        {
+            _isFbPassthroughEnabled = false;
+            _isPassthroughBackgroundColorEnabled = false;
+
+            if (_fbPassthroughLayer != OpenXRConstants.XR_NULL_HANDLE)
+            {
+                try
+                {
+                    OpenXRAPI.xrPassthroughLayerPauseFB?.Invoke(_fbPassthroughLayer);
+                    OpenXRAPI.xrDestroyPassthroughLayerFB?.Invoke(_fbPassthroughLayer);
+                }
+                catch (Exception ex)
+                {
+                    VRModCore.LogWarning($"[OpenXR] Exception while destroying passthrough layer: {ex.Message}");
+                }
+                _fbPassthroughLayer = OpenXRConstants.XR_NULL_HANDLE;
+            }
+
+            if (_fbPassthrough != OpenXRConstants.XR_NULL_HANDLE)
+            {
+                try
+                {
+                    OpenXRAPI.xrPassthroughPauseFB?.Invoke(_fbPassthrough);
+                    OpenXRAPI.xrDestroyPassthroughFB?.Invoke(_fbPassthrough);
+                }
+                catch (Exception ex)
+                {
+                    VRModCore.LogWarning($"[OpenXR] Exception while destroying passthrough feature: {ex.Message}");
+                }
+                _fbPassthrough = OpenXRConstants.XR_NULL_HANDLE;
+            }
+
+            _isFbPassthroughInitialized = false;
+            _fbPassthroughCompositionLayer = default;
+        }
+
+        private void ApplyPassthroughBackgroundToGameCamera(Camera camera)
+        {
+            if (camera == null) return;
+
+            if (!_isPassthroughBackgroundColorEnabled)
+            {
+                RestorePassthroughManagedCameraState();
+                _mainCameraClearFlags = camera.clearFlags;
+                _mainCameraBackgroundColor = camera.backgroundColor;
+                _mainCameraCullingMask = camera.cullingMask;
+                return;
+            }
+
+            if (_passthroughManagedCamera != camera)
+            {
+                RestorePassthroughManagedCameraState();
+                _passthroughManagedCamera = camera;
+                _passthroughManagedOriginalClearFlags = camera.clearFlags;
+                _passthroughManagedOriginalBackgroundColor = camera.backgroundColor;
+                _hasPassthroughManagedOriginalState = true;
+                VRModCore.Log($"[OpenXR] Managing game background camera '{camera.name}' for passthrough/color-key background.");
+            }
+
+            camera.clearFlags = CameraClearFlags.SolidColor;
+            Color configuredBackgroundColor = GetConfiguredPassthroughBackgroundColor();
+            camera.backgroundColor = configuredBackgroundColor;
+
+            _mainCameraClearFlags = camera.clearFlags;
+            _mainCameraBackgroundColor = camera.backgroundColor;
+            _mainCameraCullingMask = camera.cullingMask;
+        }
+
+        private void RestorePassthroughManagedCameraState()
+        {
+            if (!_hasPassthroughManagedOriginalState || _passthroughManagedCamera == null)
+            {
+                _passthroughManagedCamera = null;
+                _hasPassthroughManagedOriginalState = false;
+                return;
+            }
+
+            _passthroughManagedCamera.clearFlags = _passthroughManagedOriginalClearFlags;
+            _passthroughManagedCamera.backgroundColor = _passthroughManagedOriginalBackgroundColor;
+            _passthroughManagedCamera = null;
+            _hasPassthroughManagedOriginalState = false;
+        }
+
+        private Color GetConfiguredPassthroughBackgroundColor()
+        {
+            string raw = ConfigManager.OpenXR_PassthroughBackgroundColor?.Value ?? "0 0 0 255";
+            if (string.Equals(raw, _cachedPassthroughBackgroundColorRaw, StringComparison.Ordinal))
+            {
+                return _cachedPassthroughBackgroundColor;
+            }
+
+            _cachedPassthroughBackgroundColorRaw = raw;
+            string[] tokens = raw.Split(new[] { ' ', ',', ';', '|' }, StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length >= 3 &&
+                int.TryParse(tokens[0], out int r) &&
+                int.TryParse(tokens[1], out int g) &&
+                int.TryParse(tokens[2], out int b))
+            {
+                int a = 255;
+                if (tokens.Length >= 4)
+                {
+                    int.TryParse(tokens[3], out a);
+                }
+
+                _cachedPassthroughBackgroundColor = new Color32(
+                    (byte)Mathf.Clamp(r, 0, 255),
+                    (byte)Mathf.Clamp(g, 0, 255),
+                    (byte)Mathf.Clamp(b, 0, 255),
+                    (byte)Mathf.Clamp(a, 0, 255));
+                _hasLoggedInvalidPassthroughBackgroundColor = false;
+                return _cachedPassthroughBackgroundColor;
+            }
+
+            _cachedPassthroughBackgroundColor = new Color32(0, 0, 0, 255);
+            if (!_hasLoggedInvalidPassthroughBackgroundColor)
+            {
+                _hasLoggedInvalidPassthroughBackgroundColor = true;
+                VRModCore.LogWarning($"[OpenXR] Invalid passthrough background color '{raw}'. Expected 'R G B A'. Falling back to 0 0 0 255.");
+            }
+
+            return _cachedPassthroughBackgroundColor;
+        }
+
         private void InitializeSwapchains()
         {
             OpenXRAPI.xrEnumerateSwapchainFormats(_xrSession, 0, out uint formatCount, null);
@@ -1014,8 +1373,19 @@ namespace UnityVRMod.Features.VrVisualization
 
             if (submitProjectionLayer && _pLayersForSubmit != IntPtr.Zero && _pProjectionLayer != IntPtr.Zero)
             {
-                Marshal.WriteIntPtr(_pLayersForSubmit, _pProjectionLayer);
-                frameEndInfo.layerCount = 1;
+                uint layerCount = 0;
+                if (IsFbPassthroughActive() && _pFbPassthroughCompositionLayer != IntPtr.Zero)
+                {
+                    _fbPassthroughCompositionLayer.space = OpenXRConstants.XR_NULL_HANDLE;
+                    _fbPassthroughCompositionLayer.layerHandle = _fbPassthroughLayer;
+                    Marshal.StructureToPtr(_fbPassthroughCompositionLayer, _pFbPassthroughCompositionLayer, false);
+                    Marshal.WriteIntPtr(_pLayersForSubmit + (int)(layerCount * Marshal.SizeOf<IntPtr>()), _pFbPassthroughCompositionLayer);
+                    layerCount++;
+                }
+
+                Marshal.WriteIntPtr(_pLayersForSubmit + (int)(layerCount * Marshal.SizeOf<IntPtr>()), _pProjectionLayer);
+                layerCount++;
+                frameEndInfo.layerCount = layerCount;
                 frameEndInfo.layers = _pLayersForSubmit;
             }
 
@@ -1101,7 +1471,13 @@ namespace UnityVRMod.Features.VrVisualization
 
             if (currentIntermediateRT != null && currentIntermediateRT.IsCreated())
             {
-                IntPtr sourceNativePtr = currentIntermediateRT.GetNativeTexturePtr();
+                RenderTexture submitRenderTexture = currentIntermediateRT;
+                if (IsFbPassthroughActive())
+                {
+                    submitRenderTexture = BuildPassthroughAlphaFixedSubmitTexture(eyeIndex, currentIntermediateRT);
+                }
+
+                IntPtr sourceNativePtr = submitRenderTexture != null ? submitRenderTexture.GetNativeTexturePtr() : IntPtr.Zero;
                 if (sourceNativePtr != IntPtr.Zero && nativeTextureResourcePtr != IntPtr.Zero)
                 {
                     NativeBridge.DirectCopyResource_Internal(nativeTextureResourcePtr, sourceNativePtr);
@@ -1117,6 +1493,185 @@ namespace UnityVRMod.Features.VrVisualization
             {
                 _lastRightEyeRenderCpuMs = renderEyeCpuMs;
             }
+        }
+
+        private RenderTexture BuildPassthroughAlphaFixedSubmitTexture(int eyeIndex, RenderTexture sourceRenderTexture)
+        {
+            if (sourceRenderTexture == null || !sourceRenderTexture.IsCreated()) return sourceRenderTexture;
+            if (!EnsurePassthroughAlphaFixMaterial()) return sourceRenderTexture;
+
+            RenderTexture targetRenderTexture = EnsurePassthroughAlphaFixedRenderTexture(eyeIndex, sourceRenderTexture);
+            if (targetRenderTexture == null || !targetRenderTexture.IsCreated()) return sourceRenderTexture;
+
+            Color passthroughKeyColor = GetConfiguredPassthroughBackgroundColor();
+            _passthroughAlphaFixMaterial.SetColor("_KeyColor", passthroughKeyColor);
+            _passthroughAlphaFixMaterial.SetFloat("_Threshold", PassthroughKeyColorThreshold);
+
+            Graphics.Blit(sourceRenderTexture, targetRenderTexture, _passthroughAlphaFixMaterial);
+            return targetRenderTexture;
+        }
+
+        private RenderTexture EnsurePassthroughAlphaFixedRenderTexture(int eyeIndex, RenderTexture sourceRenderTexture)
+        {
+            RenderTexture existing = eyeIndex == 0 ? _leftEyePassthroughAlphaFixedRT : _rightEyePassthroughAlphaFixedRT;
+            bool needsRecreation = existing == null ||
+                                   !existing.IsCreated() ||
+                                   existing.width != sourceRenderTexture.width ||
+                                   existing.height != sourceRenderTexture.height ||
+                                   existing.graphicsFormat != sourceRenderTexture.graphicsFormat;
+            if (!needsRecreation) return existing;
+
+            if (existing != null)
+            {
+                existing.Release();
+                UnityEngine.Object.Destroy(existing);
+            }
+
+            RenderTexture created = new(sourceRenderTexture.width, sourceRenderTexture.height, 0, sourceRenderTexture.graphicsFormat)
+            {
+                name = eyeIndex == 0 ? "OpenXR_LeftEyePassthroughAlphaFixedRT" : "OpenXR_RightEyePassthroughAlphaFixedRT",
+                useMipMap = false,
+                autoGenerateMips = false,
+                filterMode = FilterMode.Bilinear
+            };
+            created.Create();
+
+            if (eyeIndex == 0)
+            {
+                _leftEyePassthroughAlphaFixedRT = created;
+            }
+            else
+            {
+                _rightEyePassthroughAlphaFixedRT = created;
+            }
+
+            return created;
+        }
+
+        private bool EnsurePassthroughAlphaFixMaterial()
+        {
+            if (_passthroughAlphaFixMaterial != null) return true;
+
+            Shader shader = Shader.Find(PassthroughAlphaFixShaderName);
+            if (shader == null)
+            {
+                shader = TryLoadPassthroughAlphaFixShaderFromBundle();
+            }
+
+            if (shader != null)
+            {
+                _passthroughAlphaFixMaterial = new Material(shader)
+                {
+                    hideFlags = HideFlags.HideAndDontSave
+                };
+            }
+
+            if (_passthroughAlphaFixMaterial == null || _passthroughAlphaFixMaterial.shader == null)
+            {
+                if (!_hasLoggedPassthroughAlphaFixUnavailable)
+                {
+                    _hasLoggedPassthroughAlphaFixUnavailable = true;
+                    VRModCore.LogWarning("[OpenXR] Passthrough alpha-fix material is unavailable. Falling back to original eye render texture; passthrough alpha artifacts may remain.");
+                }
+                return false;
+            }
+
+            if (!IsUsablePassthroughAlphaFixShader(_passthroughAlphaFixMaterial.shader))
+            {
+                if (!_hasLoggedPassthroughAlphaFixUnavailable)
+                {
+                    _hasLoggedPassthroughAlphaFixUnavailable = true;
+                    VRModCore.LogWarning($"[OpenXR] Passthrough alpha-fix shader is not usable: '{_passthroughAlphaFixMaterial.shader.name}'. Falling back to original eye render texture; passthrough alpha artifacts may remain.");
+                }
+
+                UnityEngine.Object.Destroy(_passthroughAlphaFixMaterial);
+                _passthroughAlphaFixMaterial = null;
+                return false;
+            }
+
+            if (!_hasLoggedPassthroughAlphaFixReady)
+            {
+                _hasLoggedPassthroughAlphaFixReady = true;
+                VRModCore.Log($"[OpenXR] Unity Blit passthrough alpha-fix active using shader '{_passthroughAlphaFixMaterial.shader.name}'.");
+            }
+
+            return true;
+        }
+
+        private static bool IsUsablePassthroughAlphaFixShader(Shader shader)
+        {
+            if (shader == null) return false;
+            if (shader.name.IndexOf("InternalErrorShader", StringComparison.OrdinalIgnoreCase) >= 0) return false;
+            if (!shader.isSupported) return false;
+            return true;
+        }
+
+        private Shader TryLoadPassthroughAlphaFixShaderFromBundle()
+        {
+            string bundlePath = ResolvePassthroughAlphaFixShaderBundlePath();
+            if (string.IsNullOrWhiteSpace(bundlePath) || !System.IO.File.Exists(bundlePath))
+            {
+                return null;
+            }
+
+            Type assetBundleType = ResolveTypeAnyAssembly("UnityEngine.AssetBundle");
+            MethodInfo loadFromFileMethod = assetBundleType?.GetMethod("LoadFromFile", BindingFlags.Public | BindingFlags.Static, null, new[] { typeof(string) }, null);
+            MethodInfo loadAssetMethod = assetBundleType?.GetMethod("LoadAsset", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(string), typeof(Type) }, null);
+            _passthroughAlphaFixAssetBundleUnloadMethod = assetBundleType?.GetMethod("Unload", BindingFlags.Public | BindingFlags.Instance, null, new[] { typeof(bool) }, null);
+
+            if (assetBundleType == null || loadFromFileMethod == null || loadAssetMethod == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                _passthroughAlphaFixAssetBundle = loadFromFileMethod.Invoke(null, new object[] { bundlePath });
+                if (_passthroughAlphaFixAssetBundle == null)
+                {
+                    VRModCore.LogWarning($"[OpenXR] Passthrough alpha-fix shader AssetBundle load returned null: '{bundlePath}'");
+                    return null;
+                }
+
+                object shaderAsset = loadAssetMethod.Invoke(_passthroughAlphaFixAssetBundle, new object[] { PassthroughAlphaFixShaderName, typeof(Shader) });
+                if (shaderAsset is Shader loadedShader)
+                {
+                    if (!IsUsablePassthroughAlphaFixShader(loadedShader))
+                    {
+                        VRModCore.LogWarning($"[OpenXR] Passthrough alpha-fix shader '{PassthroughAlphaFixShaderName}' loaded but is not usable: '{loadedShader.name}', supported={loadedShader.isSupported}.");
+                        return null;
+                    }
+
+                    VRModCore.Log($"[OpenXR] Loaded passthrough alpha-fix shader '{PassthroughAlphaFixShaderName}' from AssetBundle: '{bundlePath}'.");
+                    return loadedShader;
+                }
+
+                VRModCore.LogWarning($"[OpenXR] Shader '{PassthroughAlphaFixShaderName}' not found in AssetBundle: '{bundlePath}'");
+            }
+            catch (Exception ex)
+            {
+                VRModCore.LogWarning($"[OpenXR] Failed loading passthrough alpha-fix shader AssetBundle '{bundlePath}': {ex.Message}");
+            }
+
+            return null;
+        }
+
+        private static string ResolvePassthroughAlphaFixShaderBundlePath()
+        {
+            string configuredPath = ConfigManager.OpenXR_PassthroughAlphaFixShaderBundlePath?.Value ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(configuredPath))
+            {
+                configuredPath = @"OpenXRShaders\passthrough_alpha_fix";
+            }
+
+            configuredPath = configuredPath.Trim().Trim('"');
+            if (System.IO.Path.IsPathRooted(configuredPath))
+            {
+                return configuredPath;
+            }
+
+            string assemblyDir = System.IO.Path.GetDirectoryName(typeof(VrCameraSetup_CoreOpenXR).Assembly.Location) ?? string.Empty;
+            return System.IO.Path.Combine(assemblyDir, configuredPath);
         }
 
         private void LogOpenXrPerfIfNeeded()
@@ -1135,6 +1690,7 @@ namespace UnityVRMod.Features.VrVisualization
             if (_vrRig == null) return;
 
             Camera currentMainCamera = GetTrackedMainCamera();
+            ApplyPassthroughBackgroundToGameCamera(currentMainCamera);
             OpenXrControlHand activeControlHand = GetActiveControlHand();
             bool useLeftControlHand = activeControlHand == OpenXrControlHand.Left;
             bool useLeftPanelHand = (ConfigManager.OpenXR_UiPanelFollowHand?.Value ?? OpenXrControlHand.Left) == OpenXrControlHand.Left;
@@ -2463,7 +3019,9 @@ namespace UnityVRMod.Features.VrVisualization
                 _projectionLayerViews[i].subImage.imageArrayIndex = 0;
                 Marshal.StructureToPtr(_projectionLayerViews[i], _pProjectionLayerViews + (i * Marshal.SizeOf<XrCompositionLayerProjectionView>()), false);
             }
-            _projectionLayer.layerFlags = XrCompositionLayerFlags.None;
+            _projectionLayer.layerFlags = IsFbPassthroughActive()
+                ? XrCompositionLayerFlags.XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT
+                : XrCompositionLayerFlags.None;
             _projectionLayer.space = _appSpace;
             _projectionLayer.viewCount = (uint)_viewConfigViews.Count;
             _projectionLayer.views = _pProjectionLayerViews;
@@ -2525,6 +3083,7 @@ namespace UnityVRMod.Features.VrVisualization
             _gameCameraRigFollow.Reset(mainCamera);
             _initialEyeAlignmentQueued = true;
 
+            ApplyPassthroughBackgroundToGameCamera(mainCamera);
             _mainCameraClearFlags = mainCamera.clearFlags;
             _mainCameraBackgroundColor = mainCamera.backgroundColor;
             _mainCameraCullingMask = mainCamera.cullingMask;
@@ -3583,6 +4142,29 @@ namespace UnityVRMod.Features.VrVisualization
             return sb.ToString();
         }
 
+        private static Type ResolveTypeAnyAssembly(string fullTypeName)
+        {
+            Type type = Type.GetType(fullTypeName, false);
+            if (type != null) return type;
+
+            type = Type.GetType($"{fullTypeName}, UnityEngine", false);
+            if (type != null) return type;
+
+            type = Type.GetType($"{fullTypeName}, UnityEngine.CoreModule", false);
+            if (type != null) return type;
+
+            type = Type.GetType($"{fullTypeName}, UnityEngine.AssetBundleModule", false);
+            if (type != null) return type;
+
+            foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                type = assembly.GetType(fullTypeName, false);
+                if (type != null) return type;
+            }
+
+            return null;
+        }
+
         private static void CopyComponentFields(Component source, Component destination)
         {
             if (source == null || destination == null) return;
@@ -3921,6 +4503,23 @@ namespace UnityVRMod.Features.VrVisualization
             _isUsingForcedSolidClearState = false;
             if (_leftEyeIntermediateRT != null) { _leftEyeIntermediateRT.Release(); UnityEngine.Object.Destroy(_leftEyeIntermediateRT); _leftEyeIntermediateRT = null; }
             if (_rightEyeIntermediateRT != null) { _rightEyeIntermediateRT.Release(); UnityEngine.Object.Destroy(_rightEyeIntermediateRT); _rightEyeIntermediateRT = null; }
+            if (_leftEyePassthroughAlphaFixedRT != null) { _leftEyePassthroughAlphaFixedRT.Release(); UnityEngine.Object.Destroy(_leftEyePassthroughAlphaFixedRT); _leftEyePassthroughAlphaFixedRT = null; }
+            if (_rightEyePassthroughAlphaFixedRT != null) { _rightEyePassthroughAlphaFixedRT.Release(); UnityEngine.Object.Destroy(_rightEyePassthroughAlphaFixedRT); _rightEyePassthroughAlphaFixedRT = null; }
+            if (_passthroughAlphaFixMaterial != null) { UnityEngine.Object.Destroy(_passthroughAlphaFixMaterial); _passthroughAlphaFixMaterial = null; }
+            if (_passthroughAlphaFixAssetBundle != null && _passthroughAlphaFixAssetBundleUnloadMethod != null)
+            {
+                try
+                {
+                    _passthroughAlphaFixAssetBundleUnloadMethod.Invoke(_passthroughAlphaFixAssetBundle, new object[] { false });
+                }
+                catch
+                {
+                }
+            }
+            _passthroughAlphaFixAssetBundle = null;
+            _passthroughAlphaFixAssetBundleUnloadMethod = null;
+            _hasLoggedPassthroughAlphaFixReady = false;
+            _hasLoggedPassthroughAlphaFixUnavailable = false;
             if (_vrRig != null) { UnityEngine.Object.Destroy(_vrRig); _vrRig = null; }
             _leftVrCameraGO = null; _leftVrCamera = null; _rightVrCameraGO = null; _rightVrCamera = null;
             _leftVrHdrEffectCamera = null; _rightVrHdrEffectCamera = null;
@@ -3973,11 +4572,14 @@ namespace UnityVRMod.Features.VrVisualization
         public void TeardownVr()
         {
             VRModCore.LogRuntimeDebug("Tearing down OpenXR system.");
+            RestorePassthroughManagedCameraState();
             TeardownCameraRig();
             TeardownInputActions();
+            DestroyFbPassthrough();
 
             if (_pProjectionLayerViews != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayerViews); _pProjectionLayerViews = IntPtr.Zero; }
             if (_pProjectionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayer); _pProjectionLayer = IntPtr.Zero; }
+            if (_pFbPassthroughCompositionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pFbPassthroughCompositionLayer); _pFbPassthroughCompositionLayer = IntPtr.Zero; }
             if (_pLayersForSubmit != IntPtr.Zero) { Marshal.FreeHGlobal(_pLayersForSubmit); _pLayersForSubmit = IntPtr.Zero; }
 
             if (_appSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
