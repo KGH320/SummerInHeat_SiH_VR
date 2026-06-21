@@ -149,7 +149,7 @@
   <PropertyGroup Condition="'$(Configuration)'=='BIE5_Unity_Mono_OpenXR_Release'">
     <TargetFramework>net46</TargetFramework>
     <OutputPath>..\Release\OpenXR\UnityVRMod.BepInEx5.Mono\</OutputPath>
-    <DefineConstants>MONO,BIE,BIE5,OPENXR_BUILD,PHYSICS_LOG</DefineConstants>
+    <DefineConstants>MONO,BIE,BIE5,OPENXR_BUILD</DefineConstants>
     <AssemblyName>UnityVRMod.BepInEx5.Mono_OpenXR</AssemblyName>
     <Optimize>true</Optimize>
     <DebugSymbols>false</DebugSymbols>
