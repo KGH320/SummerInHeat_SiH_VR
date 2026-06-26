@@ -12,10 +12,10 @@ namespace UnityVRMod.Features.VrVisualization
 {
     internal sealed class OpenXrControllerVisualizer
     {
-        private static readonly Vector3 LeftModelPositionOffset = Vector3.zero;
-        private static readonly Vector3 RightModelPositionOffset = Vector3.zero;
-        private static readonly Quaternion LeftModelRotationOffset = Quaternion.identity;
-        private static readonly Quaternion RightModelRotationOffset = Quaternion.identity;
+        private static readonly Vector3 LeftModelPositionOffset = new Vector3(-0.05f, 0.05f, -0.05f);
+        private static readonly Vector3 RightModelPositionOffset = new Vector3(0.05f, 0.05f, -0.05f);
+        private static readonly Quaternion LeftModelRotationOffset = Quaternion.Euler(55f, 15f, 0f);
+        private static readonly Quaternion RightModelRotationOffset = Quaternion.Euler(55f, -15f, 0f);
 
         private Transform _rigTransform;
         private GameObject _root;
