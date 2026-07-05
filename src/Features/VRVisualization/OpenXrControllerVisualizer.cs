@@ -700,9 +700,9 @@ namespace UnityVRMod.Features.VrVisualization
             private void NormalizeRenderMaterials()
             {
                 Renderer[] renderers = Root.GetComponentsInChildren<Renderer>(true);
-                Shader opaqueShader = Shader.Find("Standard")
-                    ?? Shader.Find("Legacy Shaders/Diffuse")
-                    ?? Shader.Find("Diffuse");
+                Shader transparentShader = Shader.Find("Legacy Shaders/Particles/Additive")
+                    ?? Shader.Find("Unlit/Transparent Colored")
+                    ?? Shader.Find("Standard");
 
                 int normalizedRendererCount = 0;
                 for (int r = 0; r < renderers.Length; r++)
@@ -725,47 +725,61 @@ namespace UnityVRMod.Features.VrVisualization
                             continue;
                         }
 
-                        if (opaqueShader != null && (material.shader == null || material.shader.name.IndexOf("SteamVR", StringComparison.OrdinalIgnoreCase) >= 0))
+                        if (transparentShader != null)
                         {
-                            material.shader = opaqueShader;
+                            material.shader = transparentShader;
                         }
 
-                        ForceOpaqueDoubleSided(material);
+                        ApplyAdditiveBlueWhiteGhost(material);
                     }
 
                     renderer.materials = materials;
                     normalizedRendererCount++;
                 }
 
-                VRModCore.Log($"[OpenXR][HandModel] {Root.name} normalized renderers={normalizedRendererCount} for opaque two-sided rendering.");
+                VRModCore.Log($"[OpenXR][HandModel] {Root.name} normalized renderers={normalizedRendererCount} for additive blue-white ghost rendering.");
             }
 
-            private static void ForceOpaqueDoubleSided(Material material)
+            private static void ApplyAdditiveBlueWhiteGhost(Material material)
             {
                 if (material == null)
                 {
                     return;
                 }
 
-                Color color = material.HasProperty("_Color") ? material.color : Color.white;
-                color.a = 1f;
+                Color color = new(0.35f, 0.75f, 1f, 0.12f);
                 if (material.HasProperty("_Color")) material.color = color;
                 if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", color);
                 if (material.HasProperty("_TintColor")) material.SetColor("_TintColor", color);
+                if (material.HasProperty("_MainTex")) material.SetTexture("_MainTex", null);
+                if (material.HasProperty("_BaseMap")) material.SetTexture("_BaseMap", null);
+                if (material.HasProperty("_BumpMap")) material.SetTexture("_BumpMap", null);
+                if (material.HasProperty("_MetallicGlossMap")) material.SetTexture("_MetallicGlossMap", null);
+                if (material.HasProperty("_SpecGlossMap")) material.SetTexture("_SpecGlossMap", null);
+                if (material.HasProperty("_EmissionMap")) material.SetTexture("_EmissionMap", null);
 
-                if (material.HasProperty("_Mode")) material.SetFloat("_Mode", 0f);
-                if (material.HasProperty("_Surface")) material.SetFloat("_Surface", 0f);
+                if (material.HasProperty("_Mode")) material.SetFloat("_Mode", 3f);
+                if (material.HasProperty("_Surface")) material.SetFloat("_Surface", 1f);
                 if (material.HasProperty("_Blend")) material.SetFloat("_Blend", 0f);
-                if (material.HasProperty("_SrcBlend")) material.SetInt("_SrcBlend", (int)BlendMode.One);
-                if (material.HasProperty("_DstBlend")) material.SetInt("_DstBlend", (int)BlendMode.Zero);
-                if (material.HasProperty("_ZWrite")) material.SetInt("_ZWrite", 1);
-                if (material.HasProperty("_Cull")) material.SetInt("_Cull", (int)CullMode.Off);
+                if (material.HasProperty("_SrcBlend")) material.SetInt("_SrcBlend", (int)BlendMode.SrcAlpha);
+                if (material.HasProperty("_DstBlend")) material.SetInt("_DstBlend", (int)BlendMode.One);
+                if (material.HasProperty("_ZWrite")) material.SetInt("_ZWrite", 0);
+                if (material.HasProperty("_Cull")) material.SetInt("_Cull", (int)CullMode.Back);
+                if (material.HasProperty("_Glossiness")) material.SetFloat("_Glossiness", 0f);
+                if (material.HasProperty("_Metallic")) material.SetFloat("_Metallic", 0f);
+                if (material.HasProperty("_SpecularHighlights")) material.SetFloat("_SpecularHighlights", 0f);
+                if (material.HasProperty("_GlossyReflections")) material.SetFloat("_GlossyReflections", 0f);
 
+                material.SetOverrideTag("RenderType", "Transparent");
                 material.DisableKeyword("_ALPHATEST_ON");
-                material.DisableKeyword("_ALPHABLEND_ON");
+                material.EnableKeyword("_ALPHABLEND_ON");
                 material.DisableKeyword("_ALPHAPREMULTIPLY_ON");
-                material.DisableKeyword("_SURFACE_TYPE_TRANSPARENT");
-                material.renderQueue = (int)RenderQueue.Geometry;
+                material.EnableKeyword("_SURFACE_TYPE_TRANSPARENT");
+                material.DisableKeyword("_NORMALMAP");
+                material.DisableKeyword("_METALLICGLOSSMAP");
+                material.DisableKeyword("_SPECGLOSSMAP");
+                material.DisableKeyword("_EMISSION");
+                material.renderQueue = (int)RenderQueue.Transparent + 50;
             }
 
             private static Transform FindNamedTransform(IReadOnlyList<Transform> transforms, string exactName)
