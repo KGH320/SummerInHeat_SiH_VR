@@ -1,6 +1,7 @@
 #if OPENXR_BUILD
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Reflection;
 using UnityEngine;
@@ -460,6 +461,9 @@ namespace UnityVRMod.Features.VrVisualization
             private float _lastGrip = -1f;
             private float _lastTrigger = -1f;
             private float _lastCurlDegrees = float.NaN;
+            private static string _cachedHandModelColorRaw = string.Empty;
+            private static Color _cachedHandModelColor = new(0.15f, 0.15f, 0.15f, 0.30f);
+            private static bool _hasLoggedInvalidHandModelColor;
 
             public RuntimeHandModel(GameObject root, bool isLeftHand, RuntimeHandPoseSet poseSet, RuntimeHandColliderLayoutSet colliderLayoutSet)
             {
@@ -700,6 +704,8 @@ namespace UnityVRMod.Features.VrVisualization
             private void NormalizeRenderMaterials()
             {
                 Renderer[] renderers = Root.GetComponentsInChildren<Renderer>(true);
+                bool overrideMaterial = ConfigManager.OpenXR_OverrideHandModelMaterial?.Value ?? true;
+                Color configuredColor = GetConfiguredHandModelColor();
                 // 使用真正支持 alpha blend 的着色器；避开加性混合，加性混合的结果与背景颜色强相关，
                 // 会造成"距离/背景不同时透明感差别很大"的错觉。Sprites/Default 不受光照与雾影响，最稳定。
                 Shader transparentShader = Shader.Find("Sprites/Default")
@@ -728,29 +734,34 @@ namespace UnityVRMod.Features.VrVisualization
                             continue;
                         }
 
+                        if (!overrideMaterial)
+                        {
+                            continue;
+                        }
+
                         if (transparentShader != null)
                         {
                             material.shader = transparentShader;
                         }
 
-                        ApplyAlphaBlendBlueWhiteGhost(material);
+                        ApplyConfiguredTransparentHandMaterial(material, configuredColor);
                     }
 
                     renderer.materials = materials;
                     normalizedRendererCount++;
                 }
 
-                VRModCore.Log($"[OpenXR][HandModel] {Root.name} normalized renderers={normalizedRendererCount} for alpha-blend blue-white ghost rendering.");
+                string mode = overrideMaterial ? $"transparent configured color {FormatColorForLog(configuredColor)}" : "AssetBundle materials";
+                VRModCore.Log($"[OpenXR][HandModel] {Root.name} normalized renderers={normalizedRendererCount} using {mode}.");
             }
 
-            private static void ApplyAlphaBlendBlueWhiteGhost(Material material)
+            private static void ApplyConfiguredTransparentHandMaterial(Material material, Color color)
             {
                 if (material == null)
                 {
                     return;
                 }
 
-                Color color = new(0.35f, 0.75f, 1f, 0.45f);
                 if (material.HasProperty("_Color")) material.color = color;
                 if (material.HasProperty("_BaseColor")) material.SetColor("_BaseColor", color);
                 if (material.HasProperty("_TintColor")) material.SetColor("_TintColor", color);
@@ -783,6 +794,91 @@ namespace UnityVRMod.Features.VrVisualization
                 material.DisableKeyword("_SPECGLOSSMAP");
                 material.DisableKeyword("_EMISSION");
                 material.renderQueue = (int)RenderQueue.Transparent + 50;
+            }
+
+            private static Color GetConfiguredHandModelColor()
+            {
+                string rawColor = ConfigManager.OpenXR_HandModelColor?.Value ?? "0.15 0.15 0.15 0.30";
+                if (!string.Equals(rawColor, _cachedHandModelColorRaw, StringComparison.Ordinal))
+                {
+                    _cachedHandModelColorRaw = rawColor;
+                    if (TryParseConfiguredRgbaColor(rawColor, out Color parsedColor))
+                    {
+                        _cachedHandModelColor = parsedColor;
+                        _hasLoggedInvalidHandModelColor = false;
+                    }
+                    else
+                    {
+                        _cachedHandModelColor = new Color(0.15f, 0.15f, 0.15f, 0.30f);
+                        if (!_hasLoggedInvalidHandModelColor)
+                        {
+                            VRModCore.LogWarning($"[OpenXR][HandModel] Invalid OpenXR Hand Model Color '{rawColor}'. Expected 'R G B A' or 'R,G,B,A'. Falling back to 0.15 0.15 0.15 0.30.");
+                            _hasLoggedInvalidHandModelColor = true;
+                        }
+                    }
+                }
+
+                return _cachedHandModelColor;
+            }
+
+            private static bool TryParseConfiguredRgbaColor(string raw, out Color color)
+            {
+                color = new Color(0.15f, 0.15f, 0.15f, 0.30f);
+                if (string.IsNullOrWhiteSpace(raw))
+                {
+                    return false;
+                }
+
+                string[] tokens = raw.Split(new[] { ' ', ',', ';', '\t' }, StringSplitOptions.RemoveEmptyEntries);
+                if (tokens.Length != 4)
+                {
+                    return false;
+                }
+
+                if (!TryParseColorComponent(tokens[0], out float r) ||
+                    !TryParseColorComponent(tokens[1], out float g) ||
+                    !TryParseColorComponent(tokens[2], out float b) ||
+                    !TryParseAlphaComponent(tokens[3], out float a))
+                {
+                    return false;
+                }
+
+                color = new Color(r, g, b, a);
+                return true;
+            }
+
+            private static bool TryParseColorComponent(string raw, out float value)
+            {
+                value = 0f;
+                if (!float.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed))
+                {
+                    return false;
+                }
+
+                if (parsed > 1f)
+                {
+                    parsed /= 255f;
+                }
+
+                value = Mathf.Clamp01(parsed);
+                return true;
+            }
+
+            private static bool TryParseAlphaComponent(string raw, out float value)
+            {
+                value = 0.30f;
+                if (!float.TryParse(raw, NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed))
+                {
+                    return false;
+                }
+
+                value = Mathf.Clamp01(parsed);
+                return true;
+            }
+
+            private static string FormatColorForLog(Color color)
+            {
+                return string.Format(CultureInfo.InvariantCulture, "({0:0.###}, {1:0.###}, {2:0.###}, {3:0.###})", color.r, color.g, color.b, color.a);
             }
 
             private static Transform FindNamedTransform(IReadOnlyList<Transform> transforms, string exactName)

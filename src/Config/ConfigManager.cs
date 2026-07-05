@@ -60,6 +60,8 @@ namespace UnityVRMod.Config
         public static ConfigElement<string> OpenXR_RightHandModelName;
         public static ConfigElement<float> OpenXR_HandModelScale;
         public static ConfigElement<float> OpenXR_HandFingerCurlDegrees;
+        public static ConfigElement<bool> OpenXR_OverrideHandModelMaterial;
+        public static ConfigElement<string> OpenXR_HandModelColor;
 #if PHYSICS_LOG
         public static ConfigElement<bool> OpenXR_EnablePhysicsDiagnostics;
         public static ConfigElement<float> OpenXR_PhysicsDiagnosticsRadius;
@@ -245,6 +247,12 @@ namespace UnityVRMod.Config
 
             OpenXR_HandFingerCurlDegrees = new ConfigElement<float>("OpenXR Hand Finger Curl Degrees",
                 "[OpenXR ONLY] Additional local X rotation applied to resolved finger bones at full grip/trigger curl. Use a negative value if the model bends backward.", 90.0f);
+
+            OpenXR_OverrideHandModelMaterial = new ConfigElement<bool>("OpenXR Override Hand Model Material",
+                "[OpenXR ONLY] If true, replaces loaded hand model materials with the configured transparent color. If false, keeps the AssetBundle material appearance.", true);
+
+            OpenXR_HandModelColor = new ConfigElement<string>("OpenXR Hand Model Color",
+                "[OpenXR ONLY] RGBA color used when hand model material override is enabled. Format: 'R G B A' or 'R,G,B,A'. RGB values may be 0-1 floats or 0-255 integers; alpha is 0-1.", "0.15 0.15 0.15 0.30");
 
 #if PHYSICS_LOG
             OpenXR_EnablePhysicsDiagnostics = new ConfigElement<bool>("OpenXR Enable Physics Diagnostics",
