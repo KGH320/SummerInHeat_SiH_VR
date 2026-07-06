@@ -145,6 +145,8 @@ namespace UnityVRMod.Features.VrVisualization
         private OpenXrControlHand? _activeGripHand;
         private OpenXrControlHand? _lastActiveGripHand;
         private bool _wasXOrAPressed;
+        private bool _wasPassthroughShortcutPressed;
+        private bool _suppressXOrAUntilReleased;
         private float _lastXaPressTime = -1f;
         private float _xaClickPendingTime = -1f;
         private bool _wasUiTogglePressed;
@@ -1721,12 +1723,31 @@ namespace UnityVRMod.Features.VrVisualization
             bool leftXPressed = IsBooleanActionPressed(_leftXLogState);
             bool rightAPressed = IsBooleanActionPressed(_rightALogState);
             bool rightBPressed = IsBooleanActionPressed(_rightBLogState);
+            bool passthroughShortcutPressed = (leftTriggerPressed && leftXPressed) || (rightTriggerPressed && rightAPressed);
+            bool passthroughShortcutEdge = passthroughShortcutPressed && !_wasPassthroughShortcutPressed;
+            _wasPassthroughShortcutPressed = passthroughShortcutPressed;
+            if (passthroughShortcutEdge)
+            {
+                VRModCore.Log("[OpenXR] Trigger+X/A passthrough shortcut pressed.");
+                TogglePassthroughMode();
+                _xaClickPendingTime = -1f;
+                _lastXaPressTime = -1f;
+                _suppressXOrAUntilReleased = true;
+            }
+
+            if (!leftXPressed && !rightAPressed)
+            {
+                _suppressXOrAUntilReleased = false;
+            }
+
+            bool leftXForUi = leftXPressed && !_suppressXOrAUntilReleased;
+            bool rightAForUi = rightAPressed && !_suppressXOrAUntilReleased;
             bool followModeTogglePressed = IsBooleanActionPressed(_leftThumbstickClickLogState);
             HandleFollowModeToggle(followModeTogglePressed, currentMainCamera);
             ApplyGameCameraRigFollow(currentMainCamera);
 
             UpdateSubCameraMoveModeState(
-                rightAPressed,
+                rightAForUi,
                 rightBPressed,
                 rightStickX,
                 rightStickY,
@@ -1758,7 +1779,7 @@ namespace UnityVRMod.Features.VrVisualization
             }
 
             // X(左)/A(右) 双击切换面板跟随手，单击切换面板显隐
-            bool xOrAPressed = leftXPressed || rightAPressed;
+            bool xOrAPressed = leftXForUi || rightAForUi;
             bool xOrAEdge = xOrAPressed && !_wasXOrAPressed;
             if (xOrAEdge)
             {
@@ -4535,6 +4556,8 @@ namespace UnityVRMod.Features.VrVisualization
             _wasPlaneEditTriggerPressed = false;
             _wasUiTogglePressed = false;
             _wasXOrAPressed = false;
+            _wasPassthroughShortcutPressed = false;
+            _suppressXOrAUntilReleased = false;
             _lastXaPressTime = -1f;
             _xaClickPendingTime = -1f;
             _wasLeftTriggerPressed = false;
