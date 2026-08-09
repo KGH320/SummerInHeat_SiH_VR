@@ -6,6 +6,7 @@ param (
     [switch]$BIE5Only,
     [switch]$DebugBuild,
     [switch]$DebugHelper,
+    [switch]$SkipUGH,
     [switch]$PhysicsLog,
     [switch]$Deploy,
     [string]$GameDir
@@ -254,27 +255,33 @@ $OpenXrRequested = $VrBackendsToProcess.Contains("OpenXR")
 $NativeHelperReferencePath = $null
 $LibNativeHelperPath = Join-Path $LibDir $NativeHelperDllName
 if ($OpenXrRequested) {
-    Assert-RequiredFile -Path $NativeHelperProjectSolution -Description "Native helper solution"
-    $MsBuildExe = Resolve-Vs2026MsBuildPath
-    if ([string]::IsNullOrWhiteSpace($MsBuildExe)) {
-        throw "OpenXR builds require Visual Studio 2026/MSBuild 18 with the v145 C++ toolset for Win32 and x64. Install the C++ desktop workload and retry."
+    if ($SkipUGH.IsPresent) {
+        Write-Host "Skipping $NativeHelperDllName rebuild; using existing staged helper."
+        Assert-RequiredFile -Path $LibNativeHelperPath -Description "Staged native helper"
+        $NativeHelperReferencePath = $LibNativeHelperPath
+    } else {
+        Assert-RequiredFile -Path $NativeHelperProjectSolution -Description "Native helper solution"
+        $MsBuildExe = Resolve-Vs2026MsBuildPath
+        if ([string]::IsNullOrWhiteSpace($MsBuildExe)) {
+            throw "OpenXR builds require Visual Studio 2026/MSBuild 18 with the v145 C++ toolset for Win32 and x64. Install the C++ desktop workload and retry."
+        }
+
+        Write-Host "Using Visual Studio 2026 MSBuild: $MsBuildExe"
+        $CppBuildConfig = if ($DebugHelper.IsPresent) { "Debug" } else { "Release" }
+        Write-Host "Rebuilding $NativeHelperDllName ($CppBuildConfig|x64)..."
+        Invoke-CheckedCommand -FilePath $MsBuildExe -ArgumentList @(
+            $NativeHelperProjectSolution,
+            "/m",
+            "/t:Rebuild",
+            "/p:Configuration=$CppBuildConfig",
+            "/p:Platform=x64"
+        ) -Description "Native C++ helper rebuild"
+
+        $NativeHelperReferencePath = Join-Path (Join-Path $NativeHelperDllBuildOutputBase $CppBuildConfig) $NativeHelperDllName
+        Assert-RequiredFile -Path $NativeHelperReferencePath -Description "Native helper build output"
+        Copy-RequiredFile -Source $NativeHelperReferencePath -Destination $LibNativeHelperPath
+        Assert-MatchingSha256 -ReferencePath $NativeHelperReferencePath -CandidatePaths @($LibNativeHelperPath) -Description "native helper staging"
     }
-
-    Write-Host "Using Visual Studio 2026 MSBuild: $MsBuildExe"
-    $CppBuildConfig = if ($DebugHelper.IsPresent) { "Debug" } else { "Release" }
-    Write-Host "Rebuilding $NativeHelperDllName ($CppBuildConfig|x64)..."
-    Invoke-CheckedCommand -FilePath $MsBuildExe -ArgumentList @(
-        $NativeHelperProjectSolution,
-        "/m",
-        "/t:Rebuild",
-        "/p:Configuration=$CppBuildConfig",
-        "/p:Platform=x64"
-    ) -Description "Native C++ helper rebuild"
-
-    $NativeHelperReferencePath = Join-Path (Join-Path $NativeHelperDllBuildOutputBase $CppBuildConfig) $NativeHelperDllName
-    Assert-RequiredFile -Path $NativeHelperReferencePath -Description "Native helper build output"
-    Copy-RequiredFile -Source $NativeHelperReferencePath -Destination $LibNativeHelperPath
-    Assert-MatchingSha256 -ReferencePath $NativeHelperReferencePath -CandidatePaths @($LibNativeHelperPath) -Description "native helper staging"
 }
 
 # --- Build Required UniverseLib Variants ---
