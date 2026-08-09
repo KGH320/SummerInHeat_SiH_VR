@@ -40,6 +40,34 @@
 
 ---
 
+## 🛠️ Passthrough
+
+**Toggle controls:** F9 (customizable), Trigger + X, or Trigger + A.
+
+Use a toggle control to switch passthrough and the background color. When native passthrough is supported, both native passthrough and the background color change are enabled, because native passthrough requires changing the background color. When native passthrough is not supported, only the background color is changed to make it easier to configure passthrough in Virtual Desktop.
+
+### Support
+
+Native passthrough requires both the headset and runtime (the streaming software) to support `XR_FB_passthrough`.
+
+Quest 3 with Meta Horizon Link is currently supported. It is not supported when using Virtual Desktop. Other devices can be tried independently.
+
+### Steps
+
+To enable passthrough, first hide the in-game background by pressing **5**, then press a toggle control to enable VR passthrough.
+
+Native passthrough and background color changes are not yet supported in custom-character scenes or 2D dialogue scenes.
+
+### Virtual Desktop Notes
+
+Recommended Virtual Desktop settings: Color black `(0, 0, 0)`, Similarity `= 0`, Smoothness `= 1%`, and Passthrough Opacity `= 100%`.
+
+The plugin configuration must also use background color `0 0 0 255`.
+
+You can try other color combinations, but the settings above produced the best results in testing.
+
+---
+
 ## 🎮 Controls (Oculus/Meta Touch)
 
 > [!TIP]
