@@ -18,6 +18,16 @@ namespace UnityVRMod.Features.VrVisualization
 
         public bool IsVrAvailable { get; private set; } = false;
         public bool IsGameCameraFollowModeActive => _gameCameraFollowModeActive;
+        internal bool IsFullyTornDown =>
+            _xrInstance == OpenXRConstants.XR_NULL_HANDLE &&
+            _xrSession == OpenXRConstants.XR_NULL_HANDLE &&
+            _appSpace == OpenXRConstants.XR_NULL_HANDLE &&
+            _pendingCopyTicket == 0 &&
+            !_openXrFrameInProgress &&
+            _eyeSwapchains.Count == 0 &&
+            _eyeSwapchainTextures.Count == 0 &&
+            _copyCommandBuffer == null &&
+            _vrRig == null;
 
         private GameObject _vrRig = null;
         private float _currentAppliedRigScale = 1.0f;
@@ -31,6 +41,7 @@ namespace UnityVRMod.Features.VrVisualization
         private long _selectedSwapchainFormat = 0;
         private readonly List<ulong> _eyeSwapchains = [];
         private readonly List<List<IntPtr>> _eyeSwapchainImages = [];
+        private readonly List<List<Texture2D>> _eyeSwapchainTextures = [];
         private ulong _appSpace = OpenXRConstants.XR_NULL_HANDLE;
         private bool _isSessionRunning = false;
         private XrReferenceSpaceType _appSpaceType = XrReferenceSpaceType.XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -102,7 +113,15 @@ namespace UnityVRMod.Features.VrVisualization
 
         private GameObject _currentlyTrackedOriginalCameraGO = null;
         private float _lastCalculatedVerticalOffset;
-        private static CommandBuffer _flushCommandBuffer;
+        private CommandBuffer _copyCommandBuffer;
+        private IntPtr _copyRenderEventFunc = IntPtr.Zero;
+        private int _copyRenderEventId;
+        private ulong _graphicsDeviceGeneration;
+        private ulong _pendingCopyTicket;
+        private bool _pendingCopyCancellationRequested;
+        private bool _teardownRequested;
+        private bool _isTearingDown;
+        private bool _hasLoggedDeferredTeardown;
         private float _lastUpdatePosesCpuMs;
         private float _lastLeftEyeRenderCpuMs;
         private float _lastRightEyeRenderCpuMs;
@@ -115,7 +134,6 @@ namespace UnityVRMod.Features.VrVisualization
         private float _nextOpenXrPerfLogTime;
         private bool _hasLoggedXrEndFrameFailure;
 
-        private readonly List<List<IntPtr>> _eyeSwapchainSRVs = [];
         private readonly GameCameraRigFollowState _gameCameraRigFollow = new();
         private readonly OpenXrRigLocomotion _locomotion = new();
         private readonly OpenXrControllerVisualizer _controllerVisualizer = new();
@@ -138,8 +156,9 @@ namespace UnityVRMod.Features.VrVisualization
         private bool _initialEyeAlignmentQueued;
         private bool _gameCameraFollowModeActive;
         private bool _openXrFrameInProgress;
-        private bool _leftSwapchainImageAcquired;
-        private bool _rightSwapchainImageAcquired;
+        private readonly EyeSwapchainFrameState[] _eyeFrameStates = new EyeSwapchainFrameState[2];
+        private readonly uint[] _acquiredSwapchainImageIndices = new uint[2];
+        private readonly bool[] _eyeReleaseAttempted = new bool[2];
         private Vector3 _trackingRecenterLocalOffset = Vector3.zero;
         private OpenXrControlHand? _uiClickHand;
         private OpenXrControlHand? _activeGripHand;
@@ -262,12 +281,45 @@ namespace UnityVRMod.Features.VrVisualization
             Resize
         }
 
+        private enum EyeSwapchainFrameState : int
+        {
+            Idle = 0,
+            Acquired = 1,
+            Waited = 2,
+            CopySubmitted = 3,
+            Released = 4
+        }
+
+        private struct EyeCopyResources
+        {
+            public Texture SourceTexture;
+            public Texture2D DestinationTexture;
+            public IntPtr SourceNativePtr;
+            public IntPtr DestinationNativePtr;
+        }
+
         public bool InitializeVr(string applicationKey)
         {
             VRModCore.Log("Attempting to initialize OpenXR via P/Invoke...");
+            _teardownRequested = false;
+            _hasLoggedDeferredTeardown = false;
+            IsVrAvailable = false;
 
             try
             {
+                if (!NativeBridge.TryInitializeForOpenXr(
+                        Texture2D.whiteTexture,
+                        out _d3d11Device,
+                        out _copyRenderEventFunc,
+                        out _copyRenderEventId,
+                        out _graphicsDeviceGeneration,
+                        out string helperError))
+                {
+                    throw new Exception(helperError);
+                }
+
+                VRModCore.Log($"UnityGraphicsHelper ABI v{NativeBridge.RequiredAbiVersion} ready (device generation {_graphicsDeviceGeneration}).");
+
                 if (!OpenXRNativeLoader.LoadOpenXRLibrary())
                     throw new Exception("Failed to load OpenXR native library (openxr_loader.dll).");
 
@@ -288,52 +340,51 @@ namespace UnityVRMod.Features.VrVisualization
                 IntPtr pRequestedExtensions = MarshallStringUtils.MarshalStringArrayToAnsi(requestedExtensions);
 
                 // Try API 1.1 first, fall back to 1.0 for runtimes like VDXR
-                XrResult instanceResult;
                 ulong[] apiVersionsToTry = [OpenXRConstants.XR_API_VERSION_1_1, OpenXRConstants.XR_API_VERSION_1_0];
                 bool instanceCreated = false;
-                foreach (ulong apiVer in apiVersionsToTry)
+                try
                 {
-                    var appInfo = new XrApplicationInfo
+                    foreach (ulong apiVer in apiVersionsToTry)
                     {
-                        applicationName = "UnityVRMod",
-                        applicationVersion = 1,
-                        engineName = "Unity",
-                        engineVersion = 1,
-                        apiVersion = apiVer
-                    };
-                    var instanceCreateInfo = new XrInstanceCreateInfo
-                    {
-                        type = XrStructureType.XR_TYPE_INSTANCE_CREATE_INFO,
-                        applicationInfo = appInfo,
-                        enabledExtensionCount = (uint)requestedExtensions.Length,
-                        enabledExtensionNames = pRequestedExtensions
-                    };
-                    instanceResult = OpenXRAPI.xrCreateInstance(in instanceCreateInfo, out _xrInstance);
-                    if (instanceResult >= 0 && _xrInstance != OpenXRConstants.XR_NULL_HANDLE)
-                    {
-                        instanceCreated = true;
-                        VRModCore.Log($"OpenXR Instance created with API version 0x{apiVer:X}.");
-                        break;
+                        var appInfo = new XrApplicationInfo
+                        {
+                            applicationName = "UnityVRMod",
+                            applicationVersion = 1,
+                            engineName = "Unity",
+                            engineVersion = 1,
+                            apiVersion = apiVer
+                        };
+                        var instanceCreateInfo = new XrInstanceCreateInfo
+                        {
+                            type = XrStructureType.XR_TYPE_INSTANCE_CREATE_INFO,
+                            applicationInfo = appInfo,
+                            enabledExtensionCount = (uint)requestedExtensions.Length,
+                            enabledExtensionNames = pRequestedExtensions
+                        };
+                        XrResult instanceResult = OpenXRAPI.xrCreateInstance(in instanceCreateInfo, out _xrInstance);
+                        if (instanceResult >= 0 && _xrInstance != OpenXRConstants.XR_NULL_HANDLE)
+                        {
+                            instanceCreated = true;
+                            VRModCore.Log($"OpenXR Instance created with API version 0x{apiVer:X}.");
+                            break;
+                        }
+                        if (instanceResult != XrResult.XR_ERROR_API_VERSION_UNSUPPORTED)
+                        {
+                            OpenXRHelper.CheckResult(instanceResult, "xrCreateInstance");
+                        }
+                        VRModCore.LogWarning($"OpenXR runtime does not support API version 0x{apiVer:X}, trying next...");
                     }
-                    if (instanceResult != XrResult.XR_ERROR_API_VERSION_UNSUPPORTED)
-                    {
-                        OpenXRHelper.CheckResult(instanceResult, "xrCreateInstance");
-                    }
-                    VRModCore.LogWarning($"OpenXR runtime does not support API version 0x{apiVer:X}, trying next...");
                 }
-                MarshallStringUtils.FreeMarshalledStringArray(pRequestedExtensions, requestedExtensions.Length);
+                finally
+                {
+                    MarshallStringUtils.FreeMarshalledStringArray(pRequestedExtensions, requestedExtensions.Length);
+                }
                 if (!instanceCreated) throw new Exception("xrCreateInstance failed: no compatible API version found.");
 
                 VRModCore.Log($"OpenXR Instance created. Handle: {_xrInstance}");
 
                 if (!OpenXRAPI.InitializeInstanceFunctions(_xrInstance))
                     throw new Exception("Failed to initialize instance-specific OpenXR functions.");
-
-                _d3d11Device = NativeBridge.GetD3D11DevicePointer(Texture2D.whiteTexture);
-                if (_d3d11Device == IntPtr.Zero)
-                    throw new Exception("Failed to get D3D11 device pointer.");
-
-                NativeBridge.SetDevicePointerFromCSharp(_d3d11Device);
 
                 var systemGetInfo = new XrSystemGetInfo { type = XrStructureType.XR_TYPE_SYSTEM_GET_INFO, formFactor = XrFormFactor.XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY };
                 OpenXRHelper.CheckResult(OpenXRAPI.xrGetSystem(_xrInstance, in systemGetInfo, out _xrSystemId), "xrGetSystem");
@@ -345,20 +396,22 @@ namespace UnityVRMod.Features.VrVisualization
 
                 var graphicsBinding = new XrGraphicsBindingD3D11KHR { type = XrStructureType.XR_TYPE_GRAPHICS_BINDING_D3D11_KHR, device = _d3d11Device };
                 IntPtr pGraphicsBinding = Marshal.AllocHGlobal(Marshal.SizeOf(graphicsBinding));
-                Marshal.StructureToPtr(graphicsBinding, pGraphicsBinding, false);
-                var sessionCreateInfo = new XrSessionCreateInfo { type = XrStructureType.XR_TYPE_SESSION_CREATE_INFO, next = pGraphicsBinding, systemId = _xrSystemId };
-                OpenXRHelper.CheckResult(OpenXRAPI.xrCreateSession(_xrInstance, in sessionCreateInfo, out _xrSession), "xrCreateSession");
-                Marshal.FreeHGlobal(pGraphicsBinding);
+                try
+                {
+                    Marshal.StructureToPtr(graphicsBinding, pGraphicsBinding, false);
+                    var sessionCreateInfo = new XrSessionCreateInfo { type = XrStructureType.XR_TYPE_SESSION_CREATE_INFO, next = pGraphicsBinding, systemId = _xrSystemId };
+                    OpenXRHelper.CheckResult(OpenXRAPI.xrCreateSession(_xrInstance, in sessionCreateInfo, out _xrSession), "xrCreateSession");
+                }
+                finally
+                {
+                    Marshal.FreeHGlobal(pGraphicsBinding);
+                }
                 if (_xrSession == OpenXRConstants.XR_NULL_HANDLE) throw new Exception("xrCreateSession returned a null handle.");
                 VRModCore.Log($"OpenXR Session created. Handle: {_xrSession}");
 
                 InitializeInputActions();
-
-                var sessionBeginInfo = new XrSessionBeginInfo { type = XrStructureType.XR_TYPE_SESSION_BEGIN_INFO, primaryViewConfigurationType = _viewConfigType };
-                OpenXRHelper.CheckResult(OpenXRAPI.xrBeginSession(_xrSession, in sessionBeginInfo), "xrBeginSession");
-                _currentSessionState = XrSessionState.XR_SESSION_STATE_READY;
-                _isSessionRunning = true;
-                VRModCore.Log("OpenXR Session begun.");
+                _currentSessionState = XrSessionState.XR_SESSION_STATE_UNKNOWN;
+                _isSessionRunning = false;
 
                 var refSpaceCreateInfo = new XrReferenceSpaceCreateInfo { type = XrStructureType.XR_TYPE_REFERENCE_SPACE_CREATE_INFO, referenceSpaceType = XrReferenceSpaceType.XR_REFERENCE_SPACE_TYPE_STAGE, poseInReferenceSpace = new XrPosef { orientation = new XrQuaternionf { w = 1f } } };
                 if (OpenXRAPI.xrCreateReferenceSpace(_xrSession, in refSpaceCreateInfo, out _appSpace) < 0)
@@ -388,10 +441,7 @@ namespace UnityVRMod.Features.VrVisualization
                     Marshal.WriteIntPtr(_pLayersForSubmit, IntPtr.Zero);
                 }
 
-                _flushCommandBuffer ??= new CommandBuffer
-                    {
-                        name = "VRModFlush"
-                    };
+                _copyCommandBuffer = new CommandBuffer { name = "UnityVRMod OpenXR Copy" };
 
                 VRModCore.Log("OpenXR fully initialized.");
                 IsVrAvailable = true;
@@ -804,55 +854,77 @@ namespace UnityVRMod.Features.VrVisualization
         {
             try
             {
+                if (_pendingCopyTicket != 0) DrainPendingCopyBatch();
                 SafeReleaseOpenXrSwapchainImages();
-
-                if (!_openXrFrameInProgress || _xrSession == OpenXRConstants.XR_NULL_HANDLE)
-                {
-                    return;
-                }
-
-                var frameEndInfo = new XrFrameEndInfo
-                {
-                    type = XrStructureType.XR_TYPE_FRAME_END_INFO,
-                    displayTime = _xrFrameState.predictedDisplayTime,
-                    environmentBlendMode = XrEnvironmentBlendMode.XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
-                    layerCount = 0,
-                    layers = IntPtr.Zero
-                };
-                XrResult endFrameResult = OpenXRAPI.xrEndFrame(_xrSession, in frameEndInfo);
-                LogEndFrameFailureOnce(endFrameResult, in frameEndInfo);
             }
-            catch (Exception endFrameEx)
+            catch (Exception cleanupEx)
             {
-                VRModCore.LogError("[OpenXR] Failed to safely end frame after UpdatePoses exception:", endFrameEx);
+                VRModCore.LogError("[OpenXR] Failed to clean up frame resources after an exception:", cleanupEx);
             }
-            finally
-            {
-                _openXrFrameInProgress = false;
-                _leftSwapchainImageAcquired = false;
-                _rightSwapchainImageAcquired = false;
-            }
-        }
 
-        private void SafeReleaseOpenXrSwapchainImages()
-        {
-            if (!_leftSwapchainImageAcquired && !_rightSwapchainImageAcquired)
+            if (_pendingCopyTicket != 0 ||
+                !_openXrFrameInProgress ||
+                _xrSession == OpenXRConstants.XR_NULL_HANDLE)
             {
                 return;
             }
 
-            var releaseInfo = new XrSwapchainImageReleaseInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-            if (_leftSwapchainImageAcquired && _eyeSwapchains.Count > 0)
+            var frameEndInfo = new XrFrameEndInfo
             {
-                OpenXRAPI.xrReleaseSwapchainImage(_eyeSwapchains[0], in releaseInfo);
-                _leftSwapchainImageAcquired = false;
+                type = XrStructureType.XR_TYPE_FRAME_END_INFO,
+                displayTime = _xrFrameState.predictedDisplayTime,
+                environmentBlendMode = XrEnvironmentBlendMode.XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
+                layerCount = 0,
+                layers = IntPtr.Zero
+            };
+
+            try
+            {
+                EndCurrentOpenXrFrame(in frameEndInfo);
+            }
+            catch (Exception endFrameEx)
+            {
+                VRModCore.LogError("[OpenXR] Failed to safely end frame after an exception:", endFrameEx);
+            }
+        }
+
+        private bool SafeReleaseOpenXrSwapchainImages()
+        {
+            if (_pendingCopyTicket != 0)
+            {
+                NativeCopyBatchStatus drainStatus = DrainPendingCopyBatch();
+                if (!IsTerminalCopyStatus(drainStatus) || _pendingCopyTicket != 0)
+                {
+                    RequestOpenXrTeardown($"Native copy batch could not be drained: {drainStatus}.");
+                    return false;
+                }
             }
 
-            if (_rightSwapchainImageAcquired && _eyeSwapchains.Count > 1)
+            bool allReleased = true;
+            for (int eye = 0; eye < _eyeFrameStates.Length; eye++)
             {
-                OpenXRAPI.xrReleaseSwapchainImage(_eyeSwapchains[1], in releaseInfo);
-                _rightSwapchainImageAcquired = false;
+                try
+                {
+                    EyeSwapchainFrameState state = _eyeFrameStates[eye];
+                    if (state == EyeSwapchainFrameState.Waited || state == EyeSwapchainFrameState.CopySubmitted)
+                    {
+                        allReleased &= ReleaseSwapchainImage(eye);
+                    }
+                    else if (state == EyeSwapchainFrameState.Acquired)
+                    {
+                        allReleased = false;
+                        RequestOpenXrTeardown($"Eye {eye} remained acquired without a successful wait; it cannot be released safely.");
+                    }
+                }
+                catch (Exception releaseEx)
+                {
+                    allReleased = false;
+                    VRModCore.LogError($"[OpenXR] Exception while releasing swapchain image for eye {eye}:", releaseEx);
+                    RequestOpenXrTeardown($"Swapchain release threw for eye {eye}.");
+                }
             }
+
+            return allReleased;
         }
 
         private ulong StringToPath(string path)
@@ -863,10 +935,14 @@ namespace UnityVRMod.Features.VrVisualization
 
         private void InitializeViews()
         {
-            OpenXRAPI.xrEnumerateViewConfigurations(_xrInstance, _xrSystemId, 0, out uint viewConfigCountOutput, IntPtr.Zero);
+            OpenXRHelper.CheckResult(
+                OpenXRAPI.xrEnumerateViewConfigurations(_xrInstance, _xrSystemId, 0, out uint viewConfigCountOutput, IntPtr.Zero),
+                "xrEnumerateViewConfigurations(count)");
             if (viewConfigCountOutput == 0) throw new Exception("No view configurations available.");
 
-            OpenXRAPI.xrEnumerateViewConfigurationViews(_xrInstance, _xrSystemId, _viewConfigType, 0, out uint viewCountOutput, IntPtr.Zero);
+            OpenXRHelper.CheckResult(
+                OpenXRAPI.xrEnumerateViewConfigurationViews(_xrInstance, _xrSystemId, _viewConfigType, 0, out uint viewCountOutput, IntPtr.Zero),
+                "xrEnumerateViewConfigurationViews(count)");
             if (viewCountOutput == 0) throw new Exception("No views for primary stereo config.");
 
             _viewConfigViews.Clear();
@@ -874,8 +950,12 @@ namespace UnityVRMod.Features.VrVisualization
             try
             {
                 for (int i = 0; i < viewCountOutput; ++i) Marshal.StructureToPtr(new XrViewConfigurationView { type = XrStructureType.XR_TYPE_VIEW_CONFIGURATION_VIEW }, pViewStructs + (i * Marshal.SizeOf<XrViewConfigurationView>()), false);
-                OpenXRAPI.xrEnumerateViewConfigurationViews(_xrInstance, _xrSystemId, _viewConfigType, viewCountOutput, out viewCountOutput, pViewStructs);
-                for (int i = 0; i < viewCountOutput; ++i) _viewConfigViews.Add(Marshal.PtrToStructure<XrViewConfigurationView>(pViewStructs + (i * Marshal.SizeOf<XrViewConfigurationView>())));
+                OpenXRHelper.CheckResult(
+                    OpenXRAPI.xrEnumerateViewConfigurationViews(_xrInstance, _xrSystemId, _viewConfigType, viewCountOutput, out uint returnedViewCount, pViewStructs),
+                    "xrEnumerateViewConfigurationViews(values)");
+                if (returnedViewCount == 0 || returnedViewCount > viewCountOutput)
+                    throw new Exception($"OpenXR returned an invalid view count ({returnedViewCount}/{viewCountOutput}).");
+                for (int i = 0; i < returnedViewCount; ++i) _viewConfigViews.Add(Marshal.PtrToStructure<XrViewConfigurationView>(pViewStructs + (i * Marshal.SizeOf<XrViewConfigurationView>())));
             }
             finally { Marshal.FreeHGlobal(pViewStructs); }
 
@@ -1132,25 +1212,39 @@ namespace UnityVRMod.Features.VrVisualization
 
         private void InitializeSwapchains()
         {
-            OpenXRAPI.xrEnumerateSwapchainFormats(_xrSession, 0, out uint formatCount, null);
+            const long DxgiFormatB8G8R8A8Unorm = 87;
+            const long DxgiFormatB8G8R8A8UnormSrgb = 91;
+
+            OpenXRHelper.CheckResult(
+                OpenXRAPI.xrEnumerateSwapchainFormats(_xrSession, 0, out uint formatCount, null),
+                "xrEnumerateSwapchainFormats(count)");
             if (formatCount == 0) throw new Exception("No swapchain formats.");
+
             long[] formatsArray = new long[formatCount];
-            OpenXRAPI.xrEnumerateSwapchainFormats(_xrSession, formatCount, out formatCount, formatsArray);
+            OpenXRHelper.CheckResult(
+                OpenXRAPI.xrEnumerateSwapchainFormats(_xrSession, formatCount, out uint returnedFormatCount, formatsArray),
+                "xrEnumerateSwapchainFormats(values)");
+            if (returnedFormatCount == 0 || returnedFormatCount > formatCount)
+                throw new Exception($"OpenXR returned an invalid swapchain format count ({returnedFormatCount}/{formatCount}).");
+
             _supportedSwapchainFormats.Clear();
-            _supportedSwapchainFormats.AddRange(formatsArray);
-            long DXGI_FORMAT_B8G8R8A8_UNORM_SRGB = 91;
-            if (_supportedSwapchainFormats.Contains(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB))
-                _selectedSwapchainFormat = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-            else if (_supportedSwapchainFormats.Count > 0)
-                _selectedSwapchainFormat = _supportedSwapchainFormats[0];
+            for (int i = 0; i < returnedFormatCount; i++) _supportedSwapchainFormats.Add(formatsArray[i]);
+
+            if (_supportedSwapchainFormats.Contains(DxgiFormatB8G8R8A8UnormSrgb))
+                _selectedSwapchainFormat = DxgiFormatB8G8R8A8UnormSrgb;
+            else if (_supportedSwapchainFormats.Contains(DxgiFormatB8G8R8A8Unorm))
+                _selectedSwapchainFormat = DxgiFormatB8G8R8A8Unorm;
             else
-                throw new Exception("No suitable swapchain format found.");
+                throw new Exception("The OpenXR runtime does not expose a copy-compatible BGRA8 swapchain format.");
 
             VRModCore.Log($"Selected Swapchain Format (DXGI): {_selectedSwapchainFormat}");
 
             _eyeSwapchains.Clear();
             _eyeSwapchainImages.Clear();
-            _eyeSwapchainSRVs.Clear();
+            DestroySwapchainTextureWrappers();
+
+            if (_viewConfigViews.Count != 2)
+                throw new Exception($"Primary stereo requires exactly two views; runtime returned {_viewConfigViews.Count}.");
 
             for (int i = 0; i < _viewConfigViews.Count; i++)
             {
@@ -1158,9 +1252,10 @@ namespace UnityVRMod.Features.VrVisualization
                 var swapchainCreateInfo = new XrSwapchainCreateInfo
                 {
                     type = XrStructureType.XR_TYPE_SWAPCHAIN_CREATE_INFO,
-                    usageFlags = XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_SAMPLED_BIT,
+                    usageFlags = XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                                 XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
                     format = _selectedSwapchainFormat,
-                    sampleCount = view.recommendedSwapchainSampleCount,
+                    sampleCount = 1,
                     width = view.recommendedImageRectWidth,
                     height = view.recommendedImageRectHeight,
                     faceCount = 1,
@@ -1168,37 +1263,84 @@ namespace UnityVRMod.Features.VrVisualization
                     mipCount = 1
                 };
                 OpenXRHelper.CheckResult(OpenXRAPI.xrCreateSwapchain(_xrSession, in swapchainCreateInfo, out ulong scHandle), "xrCreateSwapchain");
-                _eyeSwapchains.Add(scHandle);
+                if (scHandle == OpenXRConstants.XR_NULL_HANDLE)
+                    throw new Exception($"xrCreateSwapchain returned a null handle for eye {i}.");
 
-                OpenXRAPI.xrEnumerateSwapchainImages(scHandle, 0, out uint imgCount, IntPtr.Zero);
-                IntPtr scImagesPtr = Marshal.AllocHGlobal((int)(imgCount * Marshal.SizeOf<XrSwapchainImageD3D11KHR>()));
+                IntPtr scImagesPtr = IntPtr.Zero;
                 List<IntPtr> currentEyeTexList = [];
-                List<IntPtr> currentEyeSrvList = [];
+                List<Texture2D> currentEyeUnityTextures = [];
                 try
                 {
-                    for (int j = 0; j < imgCount; ++j) Marshal.StructureToPtr(new XrSwapchainImageD3D11KHR { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR }, scImagesPtr + (j * Marshal.SizeOf<XrSwapchainImageD3D11KHR>()), false);
-                    OpenXRAPI.xrEnumerateSwapchainImages(scHandle, imgCount, out imgCount, scImagesPtr);
-                    for (int j = 0; j < imgCount; j++)
-                    {
-                        var swapchainImage = Marshal.PtrToStructure<XrSwapchainImageD3D11KHR>(scImagesPtr + (j * Marshal.SizeOf<XrSwapchainImageD3D11KHR>()));
-                        currentEyeTexList.Add(swapchainImage.texture);
-                        int hResultSrv = NativeBridge.CreateAndRegisterSRV_Internal(swapchainImage.texture, (int)_selectedSwapchainFormat, out IntPtr srvPtr);
-                        if (hResultSrv == 0 && srvPtr != IntPtr.Zero)
-                            currentEyeSrvList.Add(srvPtr);
-                        else
-                            currentEyeSrvList.Add(IntPtr.Zero);
-                    }
-                }
-                finally { Marshal.FreeHGlobal(scImagesPtr); }
+                    OpenXRHelper.CheckResult(
+                        OpenXRAPI.xrEnumerateSwapchainImages(scHandle, 0, out uint imgCount, IntPtr.Zero),
+                        $"xrEnumerateSwapchainImages(count, eye={i})");
+                    if (imgCount == 0) throw new Exception($"Swapchain for eye {i} has no images.");
 
-                _eyeSwapchainImages.Add(currentEyeTexList);
-                _eyeSwapchainSRVs.Add(currentEyeSrvList);
+                    int imageStructSize = Marshal.SizeOf<XrSwapchainImageD3D11KHR>();
+                    scImagesPtr = Marshal.AllocHGlobal(checked((int)imgCount * imageStructSize));
+                    for (int j = 0; j < imgCount; ++j) Marshal.StructureToPtr(new XrSwapchainImageD3D11KHR { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR }, scImagesPtr + (j * Marshal.SizeOf<XrSwapchainImageD3D11KHR>()), false);
+                    OpenXRHelper.CheckResult(
+                        OpenXRAPI.xrEnumerateSwapchainImages(scHandle, imgCount, out uint returnedImageCount, scImagesPtr),
+                        $"xrEnumerateSwapchainImages(values, eye={i})");
+                    if (returnedImageCount == 0 || returnedImageCount > imgCount)
+                        throw new Exception($"OpenXR returned an invalid image count for eye {i} ({returnedImageCount}/{imgCount}).");
+
+                    for (int j = 0; j < returnedImageCount; j++)
+                    {
+                        var swapchainImage = Marshal.PtrToStructure<XrSwapchainImageD3D11KHR>(scImagesPtr + (j * imageStructSize));
+                        if (swapchainImage.texture == IntPtr.Zero)
+                            throw new Exception($"OpenXR returned a null D3D11 texture for eye {i}, image {j}.");
+                        currentEyeTexList.Add(swapchainImage.texture);
+                        Texture2D externalTexture = Texture2D.CreateExternalTexture(
+                            (int)view.recommendedImageRectWidth,
+                            (int)view.recommendedImageRectHeight,
+                            TextureFormat.BGRA32,
+                            false,
+                            _selectedSwapchainFormat != DxgiFormatB8G8R8A8UnormSrgb,
+                            swapchainImage.texture);
+                        if (externalTexture == null)
+                            throw new Exception($"Unity failed to wrap the OpenXR texture for eye {i}, image {j}.");
+                        externalTexture.name = $"OpenXR_Eye{i}_SwapchainImage{j}";
+                        currentEyeUnityTextures.Add(externalTexture);
+                    }
+
+                    _eyeSwapchains.Add(scHandle);
+                    _eyeSwapchainImages.Add(currentEyeTexList);
+                    _eyeSwapchainTextures.Add(currentEyeUnityTextures);
+                    scHandle = OpenXRConstants.XR_NULL_HANDLE;
+                }
+                finally
+                {
+                    if (scImagesPtr != IntPtr.Zero) Marshal.FreeHGlobal(scImagesPtr);
+                    if (scHandle != OpenXRConstants.XR_NULL_HANDLE)
+                    {
+                        foreach (Texture2D texture in currentEyeUnityTextures)
+                            if (texture != null) UnityEngine.Object.Destroy(texture);
+                    }
+                    if (scHandle != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySwapchain != null)
+                        OpenXRAPI.xrDestroySwapchain(scHandle);
+                }
+
                 VRModCore.Log($"Swapchain for view {i} created. Images: {currentEyeTexList.Count}");
             }
         }
 
+        private void DestroySwapchainTextureWrappers()
+        {
+            foreach (List<Texture2D> eyeTextures in _eyeSwapchainTextures)
+            {
+                foreach (Texture2D texture in eyeTextures)
+                {
+                    if (texture != null) UnityEngine.Object.Destroy(texture);
+                }
+            }
+            _eyeSwapchainTextures.Clear();
+        }
+
         public void UpdatePoses()
         {
+            if (_isTearingDown) return;
+
             try
             {
                 UpdatePosesCore();
@@ -1206,7 +1348,15 @@ namespace UnityVRMod.Features.VrVisualization
             catch (Exception ex)
             {
                 VRModCore.LogError("[OpenXR] UpdatePoses EXCEPTION:", ex);
+                RequestOpenXrTeardown("Unhandled OpenXR frame exception.");
                 SafeEndOpenXrFrameAfterException();
+            }
+            finally
+            {
+                if (_teardownRequested && !_isTearingDown)
+                {
+                    TeardownVr();
+                }
             }
         }
 
@@ -1222,7 +1372,163 @@ namespace UnityVRMod.Features.VrVisualization
             _lastLeftEyeRenderCpuMs = 0f;
             _lastRightEyeRenderCpuMs = 0f;
 
-            // --- RESTORED: Full event polling and session state management ---
+            PollOpenXrEvents();
+            if (_teardownRequested) return;
+
+            ulong currentDeviceGeneration;
+            try
+            {
+                currentDeviceGeneration = NativeBridge.GetGraphicsDeviceGeneration();
+            }
+            catch (Exception ex)
+            {
+                VRModCore.LogError("[OpenXR] Failed to query the graphics device generation:", ex);
+                RequestOpenXrTeardown("UnityGraphicsHelper became unavailable.");
+                return;
+            }
+
+            if (currentDeviceGeneration == 0 || currentDeviceGeneration != _graphicsDeviceGeneration)
+            {
+                RequestOpenXrTeardown(
+                    $"D3D11 device generation changed from {_graphicsDeviceGeneration} to {currentDeviceGeneration}.");
+                return;
+            }
+
+            if (!_isSessionRunning) return;
+
+            UpdateInputStates();
+
+            var frameWaitInfo = new XrFrameWaitInfo { type = XrStructureType.XR_TYPE_FRAME_WAIT_INFO };
+            _xrFrameState = new XrFrameState { type = XrStructureType.XR_TYPE_FRAME_STATE };
+            float waitFrameStartTime = Time.realtimeSinceStartup;
+            XrResult waitFrameResult = OpenXRAPI.xrWaitFrame(_xrSession, in frameWaitInfo, out _xrFrameState);
+            _lastXrWaitFrameCpuMs = (Time.realtimeSinceStartup - waitFrameStartTime) * 1000f;
+            if (waitFrameResult < 0)
+            {
+                RequestOpenXrTeardown($"xrWaitFrame failed: {waitFrameResult}.");
+                return;
+            }
+            if (waitFrameResult == XrResult.XR_SESSION_LOSS_PENDING)
+            {
+                RequestOpenXrTeardownAfterCurrentFrame("xrWaitFrame reported XR_SESSION_LOSS_PENDING.");
+            }
+
+            var frameBeginInfo = new XrFrameBeginInfo { type = XrStructureType.XR_TYPE_FRAME_BEGIN_INFO };
+            XrResult beginFrameResult = OpenXRAPI.xrBeginFrame(_xrSession, in frameBeginInfo);
+            if (beginFrameResult < 0)
+            {
+                RequestOpenXrTeardown($"xrBeginFrame failed: {beginFrameResult}.");
+                return;
+            }
+            if (beginFrameResult == XrResult.XR_SESSION_LOSS_PENDING)
+            {
+                RequestOpenXrTeardownAfterCurrentFrame("xrBeginFrame reported XR_SESSION_LOSS_PENDING.");
+            }
+
+            _openXrFrameInProgress = true;
+            ResetEyeFrameState();
+
+            var frameEndInfo = new XrFrameEndInfo
+            {
+                type = XrStructureType.XR_TYPE_FRAME_END_INFO,
+                displayTime = _xrFrameState.predictedDisplayTime,
+                environmentBlendMode = XrEnvironmentBlendMode.XR_ENVIRONMENT_BLEND_MODE_OPAQUE,
+                layerCount = 0,
+                layers = IntPtr.Zero
+            };
+            bool locomotionUpdated = false;
+
+            try
+            {
+                bool submitProjectionLayer = false;
+                if (beginFrameResult != XrResult.XR_FRAME_DISCARDED &&
+                    _xrFrameState.shouldRender == XrBool32.XR_TRUE)
+                {
+                    bool poseIsValid = TryLocateViews();
+                    float locomotionStartTime = Time.realtimeSinceStartup;
+                    UpdateLocomotion(poseIsValid);
+                    _lastLocomotionCpuMs = (Time.realtimeSinceStartup - locomotionStartTime) * 1000f;
+                    locomotionUpdated = true;
+
+                    if (poseIsValid)
+                    {
+                        float swapchainWaitStartTime = Time.realtimeSinceStartup;
+                        bool leftReady = AcquireAndWaitSwapchainImage(0);
+                        bool rightReady = leftReady && AcquireAndWaitSwapchainImage(1);
+                        _lastSwapchainWaitCpuMs = (Time.realtimeSinceStartup - swapchainWaitStartTime) * 1000f;
+
+                        if (leftReady && rightReady &&
+                            RenderEye(0, _acquiredSwapchainImageIndices[0], out EyeCopyResources leftCopy) &&
+                            RenderEye(1, _acquiredSwapchainImageIndices[1], out EyeCopyResources rightCopy) &&
+                            SubmitAndWaitForCopyBatch(in leftCopy, in rightCopy))
+                        {
+                            bool leftReleased = ReleaseSwapchainImage(0);
+                            bool rightReleased = ReleaseSwapchainImage(1);
+                            if (leftReleased && rightReleased)
+                            {
+                                PopulateProjectionLayer();
+                                submitProjectionLayer = true;
+                            }
+                        }
+
+                        if (!submitProjectionLayer)
+                        {
+                            SafeReleaseOpenXrSwapchainImages();
+                        }
+                    }
+                }
+
+                if (!locomotionUpdated)
+                {
+                    float locomotionStartTime = Time.realtimeSinceStartup;
+                    UpdateLocomotion(false);
+                    _lastLocomotionCpuMs = (Time.realtimeSinceStartup - locomotionStartTime) * 1000f;
+                }
+
+                if (submitProjectionLayer && _pLayersForSubmit != IntPtr.Zero && _pProjectionLayer != IntPtr.Zero)
+                {
+                    uint layerCount = 0;
+                    if (IsFbPassthroughActive() && _pFbPassthroughCompositionLayer != IntPtr.Zero)
+                    {
+                        _fbPassthroughCompositionLayer.space = OpenXRConstants.XR_NULL_HANDLE;
+                        _fbPassthroughCompositionLayer.layerHandle = _fbPassthroughLayer;
+                        Marshal.StructureToPtr(_fbPassthroughCompositionLayer, _pFbPassthroughCompositionLayer, false);
+                        Marshal.WriteIntPtr(_pLayersForSubmit + (int)(layerCount * Marshal.SizeOf<IntPtr>()), _pFbPassthroughCompositionLayer);
+                        layerCount++;
+                    }
+
+                    Marshal.WriteIntPtr(_pLayersForSubmit + (int)(layerCount * Marshal.SizeOf<IntPtr>()), _pProjectionLayer);
+                    layerCount++;
+                    frameEndInfo.layerCount = layerCount;
+                    frameEndInfo.layers = _pLayersForSubmit;
+                }
+            }
+            finally
+            {
+                if (_openXrFrameInProgress)
+                {
+                    if (!SafeReleaseOpenXrSwapchainImages())
+                    {
+                        frameEndInfo.layerCount = 0;
+                        frameEndInfo.layers = IntPtr.Zero;
+                    }
+
+                    // An executing render-thread callback still owns the Unity and
+                    // swapchain textures. Keep the frame open until a later update
+                    // observes a terminal ticket state and can release both eyes.
+                    if (_pendingCopyTicket == 0)
+                    {
+                        EndCurrentOpenXrFrame(in frameEndInfo);
+                    }
+                }
+            }
+
+            _lastUpdatePosesCpuMs = (Time.realtimeSinceStartup - updatePosesStartTime) * 1000f;
+            LogOpenXrPerfIfNeeded();
+        }
+
+        private void PollOpenXrEvents()
+        {
             IntPtr eventBufferPtr = IntPtr.Zero;
             try
             {
@@ -1235,12 +1541,23 @@ namespace UnityVRMod.Features.VrVisualization
                     XrResult pollResult = OpenXRAPI.xrPollEvent(_xrInstance, eventBufferPtr);
                     if (pollResult == XrResult.XR_EVENT_UNAVAILABLE) break;
 
-                    if (pollResult < 0) { IsVrAvailable = false; break; }
+                    if (pollResult < 0)
+                    {
+                        RequestOpenXrTeardown($"xrPollEvent failed: {pollResult}.");
+                        break;
+                    }
 
                     var actualEventType = (XrStructureType)Marshal.ReadInt32(eventBufferPtr);
+                    if (actualEventType == XrStructureType.XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
+                    {
+                        RequestOpenXrTeardown("OpenXR instance loss is pending.");
+                        break;
+                    }
+
                     if (actualEventType == XrStructureType.XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
                     {
                         var stateEvent = Marshal.PtrToStructure<XrEventDataSessionStateChanged>(eventBufferPtr);
+                        if (stateEvent.session != _xrSession) continue;
                         if (stateEvent.state != _currentSessionState)
                         {
                             VRModCore.Log($"OpenXR Session State Changed: {_currentSessionState} -> {stateEvent.state}");
@@ -1251,25 +1568,24 @@ namespace UnityVRMod.Features.VrVisualization
                                 case XrSessionState.XR_SESSION_STATE_EXITING:
                                 case XrSessionState.XR_SESSION_STATE_LOSS_PENDING:
                                     _isSessionRunning = false;
-                                    IsVrAvailable = false;
+                                    RequestOpenXrTeardown($"Session entered {_currentSessionState}.");
                                     break;
                                 case XrSessionState.XR_SESSION_STATE_STOPPING:
-                                    if (_isSessionRunning)
-                                    {
-                                        VRModCore.Log("Session is stopping, calling xrEndSession.");
-                                        OpenXRAPI.xrEndSession(_xrSession);
-                                        _isSessionRunning = false;
-                                    }
+                                    RequestOpenXrTeardown("Session entered XR_SESSION_STATE_STOPPING.");
                                     break;
                                 case XrSessionState.XR_SESSION_STATE_READY:
                                     if (!_isSessionRunning)
                                     {
                                         VRModCore.Log("Session is ready, calling xrBeginSession to resume.");
                                         var beginInfo = new XrSessionBeginInfo { type = XrStructureType.XR_TYPE_SESSION_BEGIN_INFO, primaryViewConfigurationType = _viewConfigType };
-                                        if (OpenXRAPI.xrBeginSession(_xrSession, in beginInfo) == XrResult.XR_SUCCESS)
+                                        XrResult beginSessionResult = OpenXRAPI.xrBeginSession(_xrSession, in beginInfo);
+                                        if (beginSessionResult == XrResult.XR_SUCCESS)
                                         {
                                             _isSessionRunning = true;
+                                            VRModCore.Log("OpenXR session begun after READY.");
                                         }
+                                        else
+                                            RequestOpenXrTeardown($"xrBeginSession failed: {beginSessionResult}.");
                                     }
                                     break;
                             }
@@ -1278,147 +1594,396 @@ namespace UnityVRMod.Features.VrVisualization
                 }
             }
             finally { if (eventBufferPtr != IntPtr.Zero) Marshal.FreeHGlobal(eventBufferPtr); }
+        }
 
-            if (!_isSessionRunning) return;
-
-            UpdateInputStates();
-
-            var frameWaitInfo = new XrFrameWaitInfo { type = XrStructureType.XR_TYPE_FRAME_WAIT_INFO };
-            _xrFrameState.type = XrStructureType.XR_TYPE_FRAME_STATE;
-            float waitFrameStartTime = Time.realtimeSinceStartup;
-            OpenXRAPI.xrWaitFrame(_xrSession, in frameWaitInfo, out _xrFrameState);
-            _lastXrWaitFrameCpuMs = (Time.realtimeSinceStartup - waitFrameStartTime) * 1000f;
-
-            var frameBeginInfo = new XrFrameBeginInfo { type = XrStructureType.XR_TYPE_FRAME_BEGIN_INFO };
-            XrResult beginFrameResult = OpenXRAPI.xrBeginFrame(_xrSession, in frameBeginInfo);
-            if (beginFrameResult == XrResult.XR_FRAME_DISCARDED)
+        private bool TryLocateViews()
+        {
+            var viewLocateInfo = new XrViewLocateInfo
             {
-                var discardedFrameEndInfo = new XrFrameEndInfo { type = XrStructureType.XR_TYPE_FRAME_END_INFO, displayTime = _xrFrameState.predictedDisplayTime, layerCount = 0, layers = IntPtr.Zero, environmentBlendMode = XrEnvironmentBlendMode.XR_ENVIRONMENT_BLEND_MODE_OPAQUE };
-                float discardedEndFrameStartTime = Time.realtimeSinceStartup;
-                XrResult discardedEndFrameResult = OpenXRAPI.xrEndFrame(_xrSession, in discardedFrameEndInfo);
-                LogEndFrameFailureOnce(discardedEndFrameResult, in discardedFrameEndInfo);
-                _lastXrEndFrameCpuMs = (Time.realtimeSinceStartup - discardedEndFrameStartTime) * 1000f;
-                _lastUpdatePosesCpuMs = (Time.realtimeSinceStartup - updatePosesStartTime) * 1000f;
-                LogOpenXrPerfIfNeeded();
-                return;
-            }
-            if (beginFrameResult < 0)
+                type = XrStructureType.XR_TYPE_VIEW_LOCATE_INFO,
+                viewConfigurationType = _viewConfigType,
+                displayTime = _xrFrameState.predictedDisplayTime,
+                space = _appSpace
+            };
+            _locatedViewState = new XrViewState { type = XrStructureType.XR_TYPE_VIEW_STATE };
+
+            int viewSize = Marshal.SizeOf<XrView>();
+            IntPtr pLocatedViews = Marshal.AllocHGlobal(checked(viewSize * _locatedViews.Length));
+            float locateViewsStartTime = Time.realtimeSinceStartup;
+            try
             {
-                return;
-            }
-            _openXrFrameInProgress = true;
-
-            var frameEndInfo = new XrFrameEndInfo { type = XrStructureType.XR_TYPE_FRAME_END_INFO, displayTime = _xrFrameState.predictedDisplayTime, environmentBlendMode = XrEnvironmentBlendMode.XR_ENVIRONMENT_BLEND_MODE_OPAQUE, layerCount = 0, layers = IntPtr.Zero };
-            bool locomotionUpdated = false;
-            bool submitProjectionLayer = false;
-
-            if (_xrFrameState.shouldRender == XrBool32.XR_TRUE)
-            {
-                var viewLocateInfo = new XrViewLocateInfo { type = XrStructureType.XR_TYPE_VIEW_LOCATE_INFO, viewConfigurationType = _viewConfigType, displayTime = _xrFrameState.predictedDisplayTime, space = _appSpace };
-                _locatedViewState.type = XrStructureType.XR_TYPE_VIEW_STATE;
-
-                IntPtr pLocatedViews = Marshal.AllocHGlobal(Marshal.SizeOf<XrView>() * _locatedViews.Length);
-                float locateViewsStartTime = Time.realtimeSinceStartup;
-                try
+                for (int i = 0; i < _locatedViews.Length; i++)
                 {
-                    for (int i = 0; i < _locatedViews.Length; i++) Marshal.StructureToPtr(_locatedViews[i], pLocatedViews + (i * Marshal.SizeOf<XrView>()), false);
-                    OpenXRAPI.xrLocateViews(_xrSession, in viewLocateInfo, out _locatedViewState, (uint)_locatedViews.Length, out _, pLocatedViews);
-                    for (int i = 0; i < _locatedViews.Length; i++) _locatedViews[i] = Marshal.PtrToStructure<XrView>(pLocatedViews + (i * Marshal.SizeOf<XrView>()));
+                    _locatedViews[i].type = XrStructureType.XR_TYPE_VIEW;
+                    Marshal.StructureToPtr(_locatedViews[i], pLocatedViews + (i * viewSize), false);
                 }
-                finally { Marshal.FreeHGlobal(pLocatedViews); }
-                _lastXrLocateViewsCpuMs = (Time.realtimeSinceStartup - locateViewsStartTime) * 1000f;
 
-                bool poseIsValid = (_locatedViewState.viewStateFlags & XrViewStateFlags.XR_VIEW_STATE_ORIENTATION_VALID_BIT) != 0;
-                _lastPoseValidFlag = poseIsValid ? 1 : 0;
-                float locomotionStartTime = Time.realtimeSinceStartup;
-                UpdateLocomotion(poseIsValid);
-                _lastLocomotionCpuMs = (Time.realtimeSinceStartup - locomotionStartTime) * 1000f;
-                locomotionUpdated = true;
-
-                if (poseIsValid)
+                XrResult locateResult = OpenXRAPI.xrLocateViews(
+                    _xrSession,
+                    in viewLocateInfo,
+                    out _locatedViewState,
+                    (uint)_locatedViews.Length,
+                    out uint locatedViewCount,
+                    pLocatedViews);
+                if (locateResult < 0 || locatedViewCount != _locatedViews.Length)
                 {
-                    float swapchainWaitStartTime = Time.realtimeSinceStartup;
-                    var acquireInfo = new XrSwapchainImageAcquireInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
-                    XrResult acquireLeftResult = OpenXRAPI.xrAcquireSwapchainImage(_eyeSwapchains[0], in acquireInfo, out uint acquiredIdx0);
-                    _leftSwapchainImageAcquired = acquireLeftResult == XrResult.XR_SUCCESS;
-                    XrResult acquireRightResult = OpenXRAPI.xrAcquireSwapchainImage(_eyeSwapchains[1], in acquireInfo, out uint acquiredIdx1);
-                    _rightSwapchainImageAcquired = acquireRightResult == XrResult.XR_SUCCESS;
+                    RequestOpenXrTeardown($"xrLocateViews failed or returned an unexpected view count: {locateResult}, {locatedViewCount}/{_locatedViews.Length}.");
+                    return false;
+                }
+                if (locateResult == XrResult.XR_SESSION_LOSS_PENDING)
+                    RequestOpenXrTeardownAfterCurrentFrame("xrLocateViews reported XR_SESSION_LOSS_PENDING.");
 
-                    if (_leftSwapchainImageAcquired && _rightSwapchainImageAcquired)
+                for (int i = 0; i < _locatedViews.Length; i++)
+                    _locatedViews[i] = Marshal.PtrToStructure<XrView>(pLocatedViews + (i * viewSize));
+            }
+            finally
+            {
+                Marshal.FreeHGlobal(pLocatedViews);
+                _lastXrLocateViewsCpuMs = (Time.realtimeSinceStartup - locateViewsStartTime) * 1000f;
+            }
+
+            const XrViewStateFlags requiredPoseFlags =
+                XrViewStateFlags.XR_VIEW_STATE_ORIENTATION_VALID_BIT |
+                XrViewStateFlags.XR_VIEW_STATE_POSITION_VALID_BIT;
+            bool poseIsValid = (_locatedViewState.viewStateFlags & requiredPoseFlags) == requiredPoseFlags;
+            _lastPoseValidFlag = poseIsValid ? 1 : 0;
+            return poseIsValid;
+        }
+
+        private bool AcquireAndWaitSwapchainImage(int eyeIndex)
+        {
+            if (eyeIndex < 0 || eyeIndex >= _eyeFrameStates.Length ||
+                eyeIndex >= _eyeSwapchains.Count || eyeIndex >= _eyeSwapchainImages.Count ||
+                _eyeFrameStates[eyeIndex] != EyeSwapchainFrameState.Idle)
+            {
+                RequestOpenXrTeardown($"Invalid swapchain state before acquiring eye {eyeIndex}.");
+                return false;
+            }
+
+            var acquireInfo = new XrSwapchainImageAcquireInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+            XrResult acquireResult = OpenXRAPI.xrAcquireSwapchainImage(
+                _eyeSwapchains[eyeIndex], in acquireInfo, out uint imageIndex);
+            if (acquireResult < 0)
+            {
+                RequestOpenXrTeardown($"xrAcquireSwapchainImage(eye={eyeIndex}) failed: {acquireResult}.");
+                return false;
+            }
+
+            _acquiredSwapchainImageIndices[eyeIndex] = imageIndex;
+            _eyeFrameStates[eyeIndex] = EyeSwapchainFrameState.Acquired;
+            if (acquireResult == XrResult.XR_SESSION_LOSS_PENDING)
+                RequestOpenXrTeardownAfterCurrentFrame($"Acquire for eye {eyeIndex} reported XR_SESSION_LOSS_PENDING.");
+
+            var waitInfo = new XrSwapchainImageWaitInfo
+            {
+                type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+                timeout = OpenXRConstants.XR_INFINITE_DURATION
+            };
+            XrResult waitResult = XrResult.XR_TIMEOUT_EXPIRED;
+            for (int attempt = 0; attempt < 3 && waitResult == XrResult.XR_TIMEOUT_EXPIRED; attempt++)
+                waitResult = OpenXRAPI.xrWaitSwapchainImage(_eyeSwapchains[eyeIndex], in waitInfo);
+
+            if (waitResult == XrResult.XR_TIMEOUT_EXPIRED || waitResult < 0)
+            {
+                RequestOpenXrTeardown($"xrWaitSwapchainImage(eye={eyeIndex}) failed: {waitResult}.");
+                return false;
+            }
+
+            _eyeFrameStates[eyeIndex] = EyeSwapchainFrameState.Waited;
+            if (waitResult == XrResult.XR_SESSION_LOSS_PENDING)
+                RequestOpenXrTeardownAfterCurrentFrame($"Wait for eye {eyeIndex} reported XR_SESSION_LOSS_PENDING.");
+
+            if (imageIndex >= _eyeSwapchainImages[eyeIndex].Count)
+            {
+                RequestOpenXrTeardown($"OpenXR returned out-of-range swapchain image {imageIndex} for eye {eyeIndex}.");
+                return false;
+            }
+
+            return true;
+        }
+
+        private bool SubmitAndWaitForCopyBatch(
+            in EyeCopyResources left,
+            in EyeCopyResources right)
+        {
+            NativeCopyBatchStatus createStatus = NativeBridge.CreateD3D11CopyBatch(
+                left.DestinationNativePtr,
+                left.SourceNativePtr,
+                right.DestinationNativePtr,
+                right.SourceNativePtr,
+                out ulong ticket);
+            if (createStatus != NativeCopyBatchStatus.Pending || ticket == 0)
+            {
+                RequestOpenXrTeardown($"Native copy batch creation failed: {createStatus}.");
+                return false;
+            }
+
+            _pendingCopyTicket = ticket;
+            _pendingCopyCancellationRequested = false;
+            NativeCopyBatchStatus terminalStatus = NativeCopyBatchStatus.Unknown;
+            try
+            {
+                _copyCommandBuffer.Clear();
+                _copyCommandBuffer.CopyTexture(left.SourceTexture, left.DestinationTexture);
+                _copyCommandBuffer.CopyTexture(right.SourceTexture, right.DestinationTexture);
+                _copyCommandBuffer.IssuePluginEventAndData(
+                    _copyRenderEventFunc,
+                    _copyRenderEventId,
+                    new IntPtr(unchecked((long)ticket)));
+                Graphics.ExecuteCommandBuffer(_copyCommandBuffer);
+                _eyeFrameStates[0] = EyeSwapchainFrameState.CopySubmitted;
+                _eyeFrameStates[1] = EyeSwapchainFrameState.CopySubmitted;
+
+                terminalStatus = NativeBridge.WaitD3D11CopyBatch(ticket, 2000);
+                if (terminalStatus == NativeCopyBatchStatus.Timeout)
+                {
+                    NativeCopyBatchStatus cancelStatus = CancelPendingCopyBatch(ticket);
+                    if (IsTerminalCopyStatus(cancelStatus))
                     {
-                        var waitInfo = new XrSwapchainImageWaitInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO, timeout = OpenXRConstants.XR_INFINITE_DURATION };
-                        OpenXRAPI.xrWaitSwapchainImage(_eyeSwapchains[0], in waitInfo);
-                        OpenXRAPI.xrWaitSwapchainImage(_eyeSwapchains[1], in waitInfo);
-                        _lastSwapchainWaitCpuMs = (Time.realtimeSinceStartup - swapchainWaitStartTime) * 1000f;
-
-                        RenderEye(0, acquiredIdx0);
-                        RenderEye(1, acquiredIdx1);
-
-                        SafeReleaseOpenXrSwapchainImages();
-
-                        PopulateProjectionLayer();
-                        submitProjectionLayer = true;
+                        terminalStatus = cancelStatus;
                     }
                     else
                     {
-                        SafeReleaseOpenXrSwapchainImages();
+                        NativeCopyBatchStatus pollStatus = NativeBridge.WaitD3D11CopyBatch(ticket, 0);
+                        terminalStatus = pollStatus == NativeCopyBatchStatus.Timeout
+                            ? cancelStatus
+                            : pollStatus;
                     }
                 }
             }
-
-            if (!locomotionUpdated)
+            finally
             {
-                float locomotionStartTime = Time.realtimeSinceStartup;
-                UpdateLocomotion(false);
-                _lastLocomotionCpuMs = (Time.realtimeSinceStartup - locomotionStartTime) * 1000f;
+                if (!IsTerminalCopyStatus(terminalStatus))
+                    terminalStatus = DrainPendingCopyBatch();
+                else
+                    ReleasePendingCopyBatch();
             }
 
-            if (submitProjectionLayer && _pLayersForSubmit != IntPtr.Zero && _pProjectionLayer != IntPtr.Zero)
+            if (terminalStatus != NativeCopyBatchStatus.Succeeded)
             {
-                uint layerCount = 0;
-                if (IsFbPassthroughActive() && _pFbPassthroughCompositionLayer != IntPtr.Zero)
-                {
-                    _fbPassthroughCompositionLayer.space = OpenXRConstants.XR_NULL_HANDLE;
-                    _fbPassthroughCompositionLayer.layerHandle = _fbPassthroughLayer;
-                    Marshal.StructureToPtr(_fbPassthroughCompositionLayer, _pFbPassthroughCompositionLayer, false);
-                    Marshal.WriteIntPtr(_pLayersForSubmit + (int)(layerCount * Marshal.SizeOf<IntPtr>()), _pFbPassthroughCompositionLayer);
-                    layerCount++;
-                }
-
-                Marshal.WriteIntPtr(_pLayersForSubmit + (int)(layerCount * Marshal.SizeOf<IntPtr>()), _pProjectionLayer);
-                layerCount++;
-                frameEndInfo.layerCount = layerCount;
-                frameEndInfo.layers = _pLayersForSubmit;
+                string deviceReason = terminalStatus == NativeCopyBatchStatus.DeviceLost
+                    ? $" ({DescribeLastDeviceRemovedReason()})"
+                    : string.Empty;
+                RequestOpenXrTeardown($"Render-thread copy completion failed: {terminalStatus}{deviceReason}.");
+                return false;
             }
 
-            float endFrameStartTime = Time.realtimeSinceStartup;
-            XrResult endFrameResult = OpenXRAPI.xrEndFrame(_xrSession, in frameEndInfo);
-            _openXrFrameInProgress = false;
-            LogEndFrameFailureOnce(endFrameResult, in frameEndInfo);
-            _lastXrEndFrameCpuMs = (Time.realtimeSinceStartup - endFrameStartTime) * 1000f;
-            _lastUpdatePosesCpuMs = (Time.realtimeSinceStartup - updatePosesStartTime) * 1000f;
-            LogOpenXrPerfIfNeeded();
+            return true;
         }
 
-        private void RenderEye(int eyeIndex, uint swapchainImageIndex)
+        private static bool IsTerminalCopyStatus(NativeCopyBatchStatus status)
         {
+            return status == NativeCopyBatchStatus.Succeeded ||
+                   status == NativeCopyBatchStatus.Cancelled ||
+                   status == NativeCopyBatchStatus.InvalidResource ||
+                   status == NativeCopyBatchStatus.DeviceLost;
+        }
+
+        private NativeCopyBatchStatus DrainPendingCopyBatch()
+        {
+            if (_pendingCopyTicket == 0) return NativeCopyBatchStatus.Cancelled;
+
+            NativeCopyBatchStatus status = NativeCopyBatchStatus.Unknown;
+            try
+            {
+                ulong ticket = _pendingCopyTicket;
+                status = NativeBridge.WaitD3D11CopyBatch(ticket, 0);
+                if (!IsTerminalCopyStatus(status) && !_pendingCopyCancellationRequested)
+                {
+                    status = CancelPendingCopyBatch(ticket);
+                }
+
+                if (!IsTerminalCopyStatus(status))
+                {
+                    NativeCopyBatchStatus pollStatus = NativeBridge.WaitD3D11CopyBatch(ticket, 0);
+                    if (pollStatus != NativeCopyBatchStatus.Timeout)
+                        status = pollStatus;
+                }
+                return status;
+            }
+            catch (Exception ex)
+            {
+                VRModCore.LogError("[OpenXR] Failed to drain native copy batch:", ex);
+                return NativeCopyBatchStatus.Unknown;
+            }
+            finally
+            {
+                if (IsTerminalCopyStatus(status)) ReleasePendingCopyBatch();
+            }
+        }
+
+        private NativeCopyBatchStatus CancelPendingCopyBatch(ulong ticket)
+        {
+            if (ticket == 0 || ticket != _pendingCopyTicket)
+                return NativeCopyBatchStatus.Unknown;
+            if (_pendingCopyCancellationRequested)
+                return NativeBridge.WaitD3D11CopyBatch(ticket, 0);
+
+            NativeCopyBatchStatus status = NativeBridge.CancelD3D11CopyBatch(ticket);
+            _pendingCopyCancellationRequested = true;
+            return status;
+        }
+
+        private void ReleasePendingCopyBatch()
+        {
+            if (_pendingCopyTicket == 0) return;
+            ulong ticket = _pendingCopyTicket;
+            NativeBridge.ReleaseD3D11CopyBatch(ticket);
+            _pendingCopyTicket = 0;
+            _pendingCopyCancellationRequested = false;
+        }
+
+        private bool ReleaseSwapchainImage(int eyeIndex)
+        {
+            EyeSwapchainFrameState state = _eyeFrameStates[eyeIndex];
+            if (state != EyeSwapchainFrameState.Waited && state != EyeSwapchainFrameState.CopySubmitted)
+                return state == EyeSwapchainFrameState.Released || state == EyeSwapchainFrameState.Idle;
+            if (_eyeReleaseAttempted[eyeIndex]) return false;
+
+            var releaseInfo = new XrSwapchainImageReleaseInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+            _eyeReleaseAttempted[eyeIndex] = true;
+            XrResult releaseResult = OpenXRAPI.xrReleaseSwapchainImage(_eyeSwapchains[eyeIndex], in releaseInfo);
+            if (releaseResult < 0)
+            {
+                RequestOpenXrTeardown($"xrReleaseSwapchainImage(eye={eyeIndex}) failed: {releaseResult}.");
+                return false;
+            }
+
+            _eyeFrameStates[eyeIndex] = EyeSwapchainFrameState.Released;
+            if (releaseResult == XrResult.XR_SESSION_LOSS_PENDING)
+                RequestOpenXrTeardownAfterCurrentFrame($"Release for eye {eyeIndex} reported XR_SESSION_LOSS_PENDING.");
+            return true;
+        }
+
+        private void EndCurrentOpenXrFrame(in XrFrameEndInfo frameEndInfo)
+        {
+            if (!_openXrFrameInProgress) return;
+
+            float endFrameStartTime = Time.realtimeSinceStartup;
+            try
+            {
+                XrResult endFrameResult = OpenXRAPI.xrEndFrame(_xrSession, in frameEndInfo);
+                LogEndFrameFailureOnce(endFrameResult, in frameEndInfo);
+                if (endFrameResult < 0)
+                    RequestOpenXrTeardown($"xrEndFrame failed: {endFrameResult}.");
+                else if (endFrameResult == XrResult.XR_SESSION_LOSS_PENDING)
+                    RequestOpenXrTeardownAfterCurrentFrame("xrEndFrame reported XR_SESSION_LOSS_PENDING.");
+            }
+            finally
+            {
+                _openXrFrameInProgress = false;
+                _lastXrEndFrameCpuMs = (Time.realtimeSinceStartup - endFrameStartTime) * 1000f;
+                for (int eye = 0; eye < _eyeFrameStates.Length; eye++)
+                {
+                    if (_eyeFrameStates[eye] == EyeSwapchainFrameState.Released)
+                        _eyeFrameStates[eye] = EyeSwapchainFrameState.Idle;
+                }
+            }
+        }
+
+        private void ResetEyeFrameState()
+        {
+            for (int eye = 0; eye < _eyeFrameStates.Length; eye++)
+            {
+                if (_eyeFrameStates[eye] != EyeSwapchainFrameState.Idle)
+                    throw new InvalidOperationException($"Eye {eye} entered a new frame in state {_eyeFrameStates[eye]}.");
+                _acquiredSwapchainImageIndices[eye] = 0;
+                _eyeReleaseAttempted[eye] = false;
+            }
+        }
+
+        private void RequestOpenXrTeardown(string reason)
+        {
+            if (!_teardownRequested) VRModCore.LogWarning($"[OpenXR] Full teardown requested: {reason}");
+            _teardownRequested = true;
+            IsVrAvailable = false;
+        }
+
+        private void RequestOpenXrTeardownAfterCurrentFrame(string reason)
+        {
+            if (!_teardownRequested) VRModCore.LogWarning($"[OpenXR] Teardown after current frame requested: {reason}");
+            _teardownRequested = true;
+        }
+
+        private static string DescribeLastDeviceRemovedReason()
+        {
+            try
+            {
+                int reason = NativeBridge.GetLastGraphicsDeviceRemovedReason();
+                string name = unchecked((uint)reason) switch
+                {
+                    0x887A0001 => "DXGI_ERROR_INVALID_CALL",
+                    0x887A0005 => "DXGI_ERROR_DEVICE_REMOVED",
+                    0x887A0006 => "DXGI_ERROR_DEVICE_HUNG",
+                    0x887A0007 => "DXGI_ERROR_DEVICE_RESET",
+                    0x887A0020 => "DXGI_ERROR_DRIVER_INTERNAL_ERROR",
+                    0 => "S_OK (no DXGI removal reason recorded)",
+                    _ => "unknown HRESULT"
+                };
+                return $"{name}, HRESULT 0x{unchecked((uint)reason):X8}";
+            }
+            catch (Exception ex)
+            {
+                return $"device-removal HRESULT unavailable: {ex.GetType().Name}";
+            }
+        }
+
+        private bool RenderEye(int eyeIndex, uint swapchainImageIndex, out EyeCopyResources copyResources)
+        {
+            copyResources = default;
             float renderEyeStartTime = Time.realtimeSinceStartup;
+            if (eyeIndex < 0 || eyeIndex >= _eyeSwapchainImages.Count ||
+                eyeIndex >= _eyeSwapchainTextures.Count ||
+                swapchainImageIndex >= _eyeSwapchainImages[eyeIndex].Count ||
+                swapchainImageIndex >= _eyeSwapchainTextures[eyeIndex].Count ||
+                _eyeFrameStates[eyeIndex] != EyeSwapchainFrameState.Waited)
+            {
+                RequestOpenXrTeardown($"Cannot render eye {eyeIndex} from swapchain image {swapchainImageIndex} in state {_eyeFrameStates[eyeIndex]}.");
+                return false;
+            }
+
             Camera currentEyeCamera = (eyeIndex == 0) ? _leftVrCamera : _rightVrCamera;
             RenderTexture currentIntermediateRT = (eyeIndex == 0) ? _leftEyeIntermediateRT : _rightEyeIntermediateRT;
             IntPtr nativeTextureResourcePtr = _eyeSwapchainImages[eyeIndex][(int)swapchainImageIndex];
+            Texture2D destinationTexture = _eyeSwapchainTextures[eyeIndex][(int)swapchainImageIndex];
             XrViewConfigurationView viewConfig = _viewConfigViews[eyeIndex];
+            if (currentEyeCamera == null || nativeTextureResourcePtr == IntPtr.Zero || destinationTexture == null)
+            {
+                RequestOpenXrTeardown($"Eye {eyeIndex} has no camera or destination texture.");
+                return false;
+            }
 
-            bool rtNeedsRecreation = (currentIntermediateRT == null || !currentIntermediateRT.IsCreated() || currentIntermediateRT.width != (int)viewConfig.recommendedImageRectWidth || currentIntermediateRT.height != (int)viewConfig.recommendedImageRectHeight);
+            var renderTextureFormat = QualitySettings.activeColorSpace == ColorSpace.Linear
+                ? UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_SRGB
+                : UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_UNorm;
+
+            bool rtNeedsRecreation = currentIntermediateRT == null ||
+                                     !currentIntermediateRT.IsCreated() ||
+                                     currentIntermediateRT.width != (int)viewConfig.recommendedImageRectWidth ||
+                                     currentIntermediateRT.height != (int)viewConfig.recommendedImageRectHeight ||
+                                     currentIntermediateRT.antiAliasing != 1 ||
+                                     currentIntermediateRT.graphicsFormat != renderTextureFormat;
             if (rtNeedsRecreation)
             {
                 if (currentIntermediateRT != null) { currentIntermediateRT.Release(); UnityEngine.Object.Destroy(currentIntermediateRT); }
 
-                var renderTextureFormat = QualitySettings.activeColorSpace == ColorSpace.Linear
-                    ? UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_SRGB
-                    : UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_UNorm;
-
                 VRModCore.LogSpammyDebug($"Creating intermediate RenderTexture with format: {renderTextureFormat}");
-                currentIntermediateRT = new RenderTexture((int)viewConfig.recommendedImageRectWidth, (int)viewConfig.recommendedImageRectHeight, 24, renderTextureFormat);
+                currentIntermediateRT = new RenderTexture(
+                    (int)viewConfig.recommendedImageRectWidth,
+                    (int)viewConfig.recommendedImageRectHeight,
+                    24,
+                    renderTextureFormat)
+                {
+                    name = eyeIndex == 0 ? "OpenXR_LeftEyeCopySource" : "OpenXR_RightEyeCopySource",
+                    antiAliasing = 1,
+                    useMipMap = false,
+                    autoGenerateMips = false
+                };
+                if (!currentIntermediateRT.Create())
+                {
+                    RequestOpenXrTeardown($"Failed to create the single-sample copy source for eye {eyeIndex}.");
+                    return false;
+                }
 
                 if (eyeIndex == 0) _leftEyeIntermediateRT = currentIntermediateRT; else _rightEyeIntermediateRT = currentIntermediateRT;
             }
@@ -1445,9 +2010,15 @@ namespace UnityVRMod.Features.VrVisualization
             currentEyeCamera.projectionMatrix = projM;
 
             bool originalInvertCulling = GL.invertCulling;
-            GL.invertCulling = true;
-            currentEyeCamera.Render();
-            GL.invertCulling = originalInvertCulling;
+            try
+            {
+                GL.invertCulling = true;
+                currentEyeCamera.Render();
+            }
+            finally
+            {
+                GL.invertCulling = originalInvertCulling;
+            }
 
             // 非 2D 合成模式下，使用 Overlay Camera 渲染 Layer 31（VR UI 层），
             // 确保 UI 面板始终显示在场景物体前面，不受深度测试影响。
@@ -1457,10 +2028,16 @@ namespace UnityVRMod.Features.VrVisualization
                 _vrUiOverlayCamera.enabled = true;
                 CopyVrCameraTransform(currentEyeCamera, _vrUiOverlayCamera);
                 originalInvertCulling = GL.invertCulling;
-                GL.invertCulling = true;
-                _vrUiOverlayCamera.Render();
-                GL.invertCulling = originalInvertCulling;
-                _vrUiOverlayCamera.enabled = false;
+                try
+                {
+                    GL.invertCulling = true;
+                    _vrUiOverlayCamera.Render();
+                }
+                finally
+                {
+                    GL.invertCulling = originalInvertCulling;
+                    _vrUiOverlayCamera.enabled = false;
+                }
             }
 
             if (EnableOpenXrPostFxSync && !(ConfigManager.OpenXR_DisablePostFxSync?.Value == true))
@@ -1468,7 +2045,6 @@ namespace UnityVRMod.Features.VrVisualization
                 RenderHdrEffectCameraForEye(eyeIndex, currentEyeCamera, currentIntermediateRT);
             }
             currentEyeCamera.enabled = false;
-            Graphics.ExecuteCommandBuffer(_flushCommandBuffer);
             RenderTexture.active = null;
 
             if (currentIntermediateRT != null && currentIntermediateRT.IsCreated())
@@ -1479,11 +2055,10 @@ namespace UnityVRMod.Features.VrVisualization
                     submitRenderTexture = BuildPassthroughAlphaFixedSubmitTexture(eyeIndex, currentIntermediateRT);
                 }
 
-                IntPtr sourceNativePtr = submitRenderTexture != null ? submitRenderTexture.GetNativeTexturePtr() : IntPtr.Zero;
-                if (sourceNativePtr != IntPtr.Zero && nativeTextureResourcePtr != IntPtr.Zero)
-                {
-                    NativeBridge.DirectCopyResource_Internal(nativeTextureResourcePtr, sourceNativePtr);
-                }
+                copyResources.SourceTexture = submitRenderTexture;
+                copyResources.DestinationTexture = destinationTexture;
+                copyResources.SourceNativePtr = submitRenderTexture != null ? submitRenderTexture.GetNativeTexturePtr() : IntPtr.Zero;
+                copyResources.DestinationNativePtr = nativeTextureResourcePtr;
             }
 
             float renderEyeCpuMs = (Time.realtimeSinceStartup - renderEyeStartTime) * 1000f;
@@ -1495,6 +2070,13 @@ namespace UnityVRMod.Features.VrVisualization
             {
                 _lastRightEyeRenderCpuMs = renderEyeCpuMs;
             }
+            bool resourcesAreValid = copyResources.SourceTexture != null &&
+                                     copyResources.DestinationTexture != null &&
+                                     copyResources.SourceNativePtr != IntPtr.Zero &&
+                                     copyResources.DestinationNativePtr != IntPtr.Zero;
+            if (!resourcesAreValid)
+                RequestOpenXrTeardown($"Eye {eyeIndex} produced a null D3D11 copy resource.");
+            return resourcesAreValid;
         }
 
         private RenderTexture BuildPassthroughAlphaFixedSubmitTexture(int eyeIndex, RenderTexture sourceRenderTexture)
@@ -4566,9 +5148,6 @@ namespace UnityVRMod.Features.VrVisualization
             _followModeResetQueued = false;
             _initialEyeAlignmentQueued = false;
             _gameCameraFollowModeActive = false;
-            _openXrFrameInProgress = false;
-            _leftSwapchainImageAcquired = false;
-            _rightSwapchainImageAcquired = false;
             _uiClickHand = null;
             _activeGripHand = null;
             _lastActiveGripHand = null;
@@ -4594,46 +5173,164 @@ namespace UnityVRMod.Features.VrVisualization
 
         public void TeardownVr()
         {
-            VRModCore.LogRuntimeDebug("Tearing down OpenXR system.");
-            RestorePassthroughManagedCameraState();
-            TeardownCameraRig();
-            TeardownInputActions();
-            DestroyFbPassthrough();
-
-            if (_pProjectionLayerViews != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayerViews); _pProjectionLayerViews = IntPtr.Zero; }
-            if (_pProjectionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayer); _pProjectionLayer = IntPtr.Zero; }
-            if (_pFbPassthroughCompositionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pFbPassthroughCompositionLayer); _pFbPassthroughCompositionLayer = IntPtr.Zero; }
-            if (_pLayersForSubmit != IntPtr.Zero) { Marshal.FreeHGlobal(_pLayersForSubmit); _pLayersForSubmit = IntPtr.Zero; }
-
-            if (_appSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
-                OpenXRAPI.xrDestroySpace(_appSpace);
-
-            if (_eyeSwapchainSRVs != null)
-            {
-                foreach (var srvList in _eyeSwapchainSRVs)
-                    foreach (var srv in srvList)
-                        if (srv != IntPtr.Zero) NativeBridge.ReleaseNativeObject_Internal(srv);
-            }
-
-            if (_eyeSwapchains.Count > 0)
-            {
-                foreach (ulong sc in _eyeSwapchains)
-                    if (sc != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySwapchain != null)
-                        OpenXRAPI.xrDestroySwapchain(sc);
-            }
-
-            if (_xrSession != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySession != null)
-                OpenXRAPI.xrDestroySession(_xrSession);
-
-            if (_xrInstance != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyInstance != null)
-                OpenXRAPI.xrDestroyInstance(_xrInstance);
-
-            _xrInstance = OpenXRConstants.XR_NULL_HANDLE;
-            _xrSession = OpenXRConstants.XR_NULL_HANDLE;
-            _appSpace = OpenXRConstants.XR_NULL_HANDLE;
-
-            OpenXRNativeLoader.FreeOpenXRLibrary();
+            if (_isTearingDown) return;
+            _isTearingDown = true;
+            if (!_hasLoggedDeferredTeardown)
+                VRModCore.LogRuntimeDebug("Tearing down OpenXR system.");
             IsVrAvailable = false;
+
+            try
+            {
+                bool swapchainImagesReady = PrepareSwapchainImagesForTeardown();
+                SafeEndOpenXrFrameAfterException();
+
+                if (_pendingCopyTicket != 0 || _openXrFrameInProgress || !swapchainImagesReady)
+                {
+                    if (!_hasLoggedDeferredTeardown)
+                    {
+                        _hasLoggedDeferredTeardown = true;
+                        VRModCore.LogWarning(
+                            "[OpenXR] Deferring teardown until pending copy/frame/swapchain work is safe to release.");
+                    }
+                    _teardownRequested = true;
+                    return;
+                }
+
+                EndStoppingOpenXrSessionForTeardown();
+                RestorePassthroughManagedCameraState();
+                TeardownCameraRig();
+                TeardownInputActions();
+                DestroyFbPassthrough();
+
+                if (_pProjectionLayerViews != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayerViews); _pProjectionLayerViews = IntPtr.Zero; }
+                if (_pProjectionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayer); _pProjectionLayer = IntPtr.Zero; }
+                if (_pFbPassthroughCompositionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pFbPassthroughCompositionLayer); _pFbPassthroughCompositionLayer = IntPtr.Zero; }
+                if (_pLayersForSubmit != IntPtr.Zero) { Marshal.FreeHGlobal(_pLayersForSubmit); _pLayersForSubmit = IntPtr.Zero; }
+
+                DestroySwapchainTextureWrappers();
+                foreach (ulong sc in _eyeSwapchains)
+                {
+                    if (sc != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySwapchain != null)
+                        LogOpenXrTeardownResult("xrDestroySwapchain", OpenXRAPI.xrDestroySwapchain(sc));
+                }
+                _eyeSwapchains.Clear();
+                _eyeSwapchainImages.Clear();
+
+                if (_appSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
+                {
+                    LogOpenXrTeardownResult("xrDestroySpace(app)", OpenXRAPI.xrDestroySpace(_appSpace));
+                    _appSpace = OpenXRConstants.XR_NULL_HANDLE;
+                }
+
+                if (_xrSession != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySession != null)
+                {
+                    LogOpenXrTeardownResult("xrDestroySession", OpenXRAPI.xrDestroySession(_xrSession));
+                    _xrSession = OpenXRConstants.XR_NULL_HANDLE;
+                }
+
+                if (_xrInstance != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyInstance != null)
+                {
+                    LogOpenXrTeardownResult("xrDestroyInstance", OpenXRAPI.xrDestroyInstance(_xrInstance));
+                    _xrInstance = OpenXRConstants.XR_NULL_HANDLE;
+                }
+
+                if (_copyCommandBuffer != null)
+                {
+                    _copyCommandBuffer.Release();
+                    _copyCommandBuffer = null;
+                }
+
+                OpenXRNativeLoader.FreeOpenXRLibrary();
+                _supportedSwapchainFormats.Clear();
+                _viewConfigViews.Clear();
+                _locatedViews = null;
+                _projectionLayerViews = null;
+                _selectedSwapchainFormat = 0;
+                _xrSystemId = OpenXRConstants.XR_NULL_SYSTEM_ID;
+                _currentSessionState = XrSessionState.XR_SESSION_STATE_UNKNOWN;
+                _isSessionRunning = false;
+                _d3d11Device = IntPtr.Zero;
+                _copyRenderEventFunc = IntPtr.Zero;
+                _copyRenderEventId = 0;
+                _graphicsDeviceGeneration = 0;
+                _pendingCopyCancellationRequested = false;
+                for (int eye = 0; eye < _eyeFrameStates.Length; eye++)
+                {
+                    _eyeFrameStates[eye] = EyeSwapchainFrameState.Idle;
+                    _acquiredSwapchainImageIndices[eye] = 0;
+                    _eyeReleaseAttempted[eye] = false;
+                }
+                _teardownRequested = false;
+                _hasLoggedDeferredTeardown = false;
+            }
+            catch (Exception ex)
+            {
+                VRModCore.LogError("[OpenXR] Exception during teardown:", ex);
+                _teardownRequested = true;
+            }
+            finally
+            {
+                IsVrAvailable = false;
+                _isTearingDown = false;
+            }
+        }
+
+        private void EndStoppingOpenXrSessionForTeardown()
+        {
+            if (!_isSessionRunning ||
+                _currentSessionState != XrSessionState.XR_SESSION_STATE_STOPPING ||
+                _xrSession == OpenXRConstants.XR_NULL_HANDLE)
+            {
+                return;
+            }
+
+            VRModCore.Log("Session is stopping, calling xrEndSession after completing the current frame.");
+            if (OpenXRAPI.xrEndSession != null)
+            {
+                XrResult endSessionResult = OpenXRAPI.xrEndSession(_xrSession);
+                if (endSessionResult < 0)
+                    VRModCore.LogWarning($"[OpenXR] xrEndSession failed: {endSessionResult}.");
+            }
+            else
+            {
+                VRModCore.LogWarning("[OpenXR] xrEndSession was unavailable during teardown.");
+            }
+
+            _isSessionRunning = false;
+        }
+
+        private bool PrepareSwapchainImagesForTeardown()
+        {
+            if (_pendingCopyTicket != 0) DrainPendingCopyBatch();
+            if (_xrSession == OpenXRConstants.XR_NULL_HANDLE) return _pendingCopyTicket == 0;
+
+            bool shouldRetrySwapchainWait = false;
+
+            for (int eye = 0; eye < _eyeFrameStates.Length && eye < _eyeSwapchains.Count; eye++)
+            {
+                if (_eyeFrameStates[eye] != EyeSwapchainFrameState.Acquired) continue;
+
+                var waitInfo = new XrSwapchainImageWaitInfo
+                {
+                    type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO,
+                    timeout = 0
+                };
+                XrResult waitResult = OpenXRAPI.xrWaitSwapchainImage(_eyeSwapchains[eye], in waitInfo);
+                if (waitResult >= 0 && waitResult != XrResult.XR_TIMEOUT_EXPIRED)
+                    _eyeFrameStates[eye] = EyeSwapchainFrameState.Waited;
+                else if (waitResult == XrResult.XR_TIMEOUT_EXPIRED)
+                    shouldRetrySwapchainWait = true;
+                else
+                    VRModCore.LogWarning($"[OpenXR] Could not finish waiting for eye {eye} during teardown: {waitResult}.");
+            }
+
+            SafeReleaseOpenXrSwapchainImages();
+            return !shouldRetrySwapchainWait;
+        }
+
+        private static void LogOpenXrTeardownResult(string operation, XrResult result)
+        {
+            if (result < 0) VRModCore.LogWarning($"[OpenXR] {operation} failed during teardown: {result}.");
         }
 
         private static Matrix4x4 CreateProjectionMatrixFromFovUsingFrustum(XrFovf fov, float nearClip, float farClip)

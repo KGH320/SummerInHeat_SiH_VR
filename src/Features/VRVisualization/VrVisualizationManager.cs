@@ -14,6 +14,7 @@ namespace UnityVRMod.Features.VrVisualization
     {
         private IVrCameraSetup _cameraSetup;
         private bool _managerInitialized = false;
+        private bool _shutdownRequested;
         private GameObject _currentlyTrackedOriginalCameraGO = null;
 
         private bool _isUserSafeModeActive = true;
@@ -107,6 +108,7 @@ namespace UnityVRMod.Features.VrVisualization
         {
             if (_managerInitialized) return;
             _managerInitialized = true;
+            _shutdownRequested = false;
 
             if (!ConfigManager.EnableVrInjection.Value)
             {
@@ -135,10 +137,27 @@ namespace UnityVRMod.Features.VrVisualization
 
         private bool EnsureAndInitializeVrSubsystem()
         {
-            if (_cameraSetup != null && _cameraSetup.IsVrAvailable)
+            if (_shutdownRequested)
             {
-                VRModCore.LogRuntimeDebug("VR subsystem already initialized and available.");
-                return true;
+                VRModCore.LogWarning("VR subsystem initialization was ignored because shutdown is in progress.");
+                return false;
+            }
+
+            if (_cameraSetup != null)
+            {
+                if (_cameraSetup.IsVrAvailable)
+                {
+                    VRModCore.LogRuntimeDebug("VR subsystem already initialized and available.");
+                    return true;
+                }
+
+                if (!IsCameraSetupFullyTornDown(_cameraSetup))
+                {
+                    VRModCore.LogWarning("VR subsystem initialization is deferred until the previous backend finishes teardown.");
+                    return false;
+                }
+
+                _cameraSetup = null;
             }
 
             VRModCore.LogRuntimeDebug("Attempting to initialize VR subsystem...");
@@ -172,7 +191,8 @@ namespace UnityVRMod.Features.VrVisualization
                 if (!_cameraSetup.InitializeVr(ConfigManager.VrApplicationKey.Value))
                 {
                     VRModCore.LogWarning("VR subsystem initialization failed.");
-                    _cameraSetup = null;
+                    if (IsCameraSetupFullyTornDown(_cameraSetup))
+                        _cameraSetup = null;
                     return false;
                 }
 
@@ -184,9 +204,31 @@ namespace UnityVRMod.Features.VrVisualization
             catch (Exception ex)
             {
                 VRModCore.LogError("Exception during VR subsystem instantiation or initialization:", ex);
-                _cameraSetup = null;
+                if (_cameraSetup != null)
+                {
+                    try
+                    {
+                        _cameraSetup.TeardownVr();
+                    }
+                    catch (Exception teardownEx)
+                    {
+                        VRModCore.LogError("Exception while tearing down the failed VR backend:", teardownEx);
+                    }
+
+                    if (IsCameraSetupFullyTornDown(_cameraSetup))
+                        _cameraSetup = null;
+                }
                 return false;
             }
+        }
+
+        private static bool IsCameraSetupFullyTornDown(IVrCameraSetup cameraSetup)
+        {
+#if OPENXR_BUILD
+            if (cameraSetup is VrCameraSetup_CoreOpenXR openXrCameraSetup)
+                return openXrCameraSetup.IsFullyTornDown;
+#endif
+            return true;
         }
 
         private void OnActiveSceneChanged(Scene current, Scene next)
@@ -218,6 +260,16 @@ namespace UnityVRMod.Features.VrVisualization
             _isUserSafeModeActive = !_isUserSafeModeActive;
             VRModCore.Log($"User Safe Mode Toggled. Now: {(_isUserSafeModeActive ? "ACTIVE (Rendering OFF)" : "INACTIVE (Rendering ON)")}");
 
+#if OPENXR_BUILD
+            if (_cameraSetup is VrCameraSetup_CoreOpenXR pendingOpenXrCameraSetup &&
+                !pendingOpenXrCameraSetup.IsVrAvailable &&
+                !pendingOpenXrCameraSetup.IsFullyTornDown)
+            {
+                VRModCore.LogRuntimeDebug("Safe Mode state updated while OpenXR teardown is still pending.");
+                return;
+            }
+#endif
+
             if (_isUserSafeModeActive)
             {
                 if (_cameraSetup != null)
@@ -229,6 +281,13 @@ namespace UnityVRMod.Features.VrVisualization
                     {
                         VRModCore.Log("Tearing down full VR subsystem for re-initialization.");
                         _cameraSetup.TeardownVr();
+#if OPENXR_BUILD
+                        if (_cameraSetup is VrCameraSetup_CoreOpenXR openXrCameraSetup &&
+                            !openXrCameraSetup.IsFullyTornDown)
+                        {
+                            return;
+                        }
+#endif
                         _cameraSetup = null;
                         _hasVrBeenAttemptedByUser = false;
                         CameraFinder.InvalidateCache();
@@ -273,6 +332,45 @@ namespace UnityVRMod.Features.VrVisualization
 
         internal void Update()
         {
+#if OPENXR_BUILD
+            if (_shutdownRequested)
+            {
+                if (_cameraSetup != null)
+                {
+                    _cameraSetup.TeardownVr();
+                    if (!IsCameraSetupFullyTornDown(_cameraSetup))
+                        return;
+                    _cameraSetup = null;
+                }
+                return;
+            }
+#endif
+
+#if OPENXR_BUILD
+            if (_cameraSetup != null && !_cameraSetup.IsVrAvailable)
+            {
+                bool shouldAttemptRecovery = _hasVrBeenAttemptedByUser && !_isUserSafeModeActive;
+                _cameraSetup.TeardownVr();
+                if (!IsCameraSetupFullyTornDown(_cameraSetup))
+                {
+                    return;
+                }
+
+                VRModCore.LogRuntimeDebug("VR backend teardown completed.");
+                _cameraSetup = null;
+                _hasVrBeenAttemptedByUser = false;
+                _currentlyTrackedOriginalCameraGO = null;
+                CameraFinder.InvalidateCache();
+
+                if (shouldAttemptRecovery && !EnsureAndInitializeVrSubsystem())
+                {
+                    VRModCore.LogError("Failed to recover the VR backend. Re-enabling Safe Mode.");
+                    _isUserSafeModeActive = true;
+                }
+                return;
+            }
+#endif
+
             if (_cameraSetup == null && _hasVrBeenAttemptedByUser)
             {
                 if (!_isUserSafeModeActive)
@@ -393,6 +491,7 @@ namespace UnityVRMod.Features.VrVisualization
         internal void Shutdown()
         {
             VRModCore.LogRuntimeDebug("Shutdown called.");
+            _shutdownRequested = true;
             if (ConfigManager.EnableAutomaticSafeMode.Value && _sceneChangedActionDelegate != null)
             {
                 SceneManager.activeSceneChanged -= _sceneChangedActionDelegate;

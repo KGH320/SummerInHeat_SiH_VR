@@ -1,73 +1,169 @@
 name: Build and Release UnityVRMod
 
 on:
-  # Run on pushes to the main branch for continuous integration
   push:
-    branches: [ main, dev ]
-  # Run when a new release is published in GitHub
+    branches: [main, dev]
   release:
-    types: [ published ]
+    types: [published]
 
 permissions:
   contents: write
+
 jobs:
   build-and-package:
-    runs-on: windows-latest
+    runs-on: windows-2025
 
     steps:
-      # Step 1: Check out the repository's code
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          submodules: 'recursive'
+          submodules: recursive
 
-      # Step 2: Set up MSBuild
-      # This action finds msbuild.exe and adds it to the PATH.
-      - name: Add MSBuild to PATH
-        uses: microsoft/setup-msbuild@v1.3.1
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
 
-      # Step 3: Run the PowerShell build script
-      # This script is responsible for building the C++ helper and all C# configurations.
-      - name: Run Build Script
+      - name: Add Visual Studio 2026 MSBuild to PATH
+        uses: microsoft/setup-msbuild@v2
+        with:
+          vs-version: '[18.0,19.0)'
+          msbuild-architecture: x64
+
+      - name: Verify VS 2026 and v145 project toolchain
         shell: pwsh
-        run: ./build.ps1
+        run: |
+          $ErrorActionPreference = 'Stop'
 
-      # Step 4: Get the version for naming the artifacts
-      # This extracts the version from the release tag (e.g., "v0.1.0-beta")
-      # For branch pushes, it will use the short commit hash as a unique identifier.
-      - name: Get Version Name
-        id: get_version
+          $msbuild = (Get-Command msbuild -ErrorAction Stop).Source
+          $versionOutput = & $msbuild -nologo -version
+          if ($LASTEXITCODE -ne 0) {
+            throw "MSBuild version check failed with exit code $LASTEXITCODE."
+          }
+          $versionMatch = [regex]::Match(($versionOutput -join "`n"), '(?m)^\s*(?<version>\d+\.\d+(?:\.\d+){0,2})\s*$')
+          if (-not $versionMatch.Success) {
+            throw 'Could not parse the MSBuild version.'
+          }
+          $version = [Version]$versionMatch.Groups['version'].Value
+          if ($version.Major -ne 18) {
+            throw "MSBuild 18 is required; found $version at $msbuild."
+          }
+
+          [xml]$project = Get-Content -LiteralPath 'UnityGraphicsHelper/UnityGraphicsHelper.vcxproj'
+          $namespace = [System.Xml.XmlNamespaceManager]::new($project.NameTable)
+          $namespace.AddNamespace('msb', 'http://schemas.microsoft.com/developer/msbuild/2003')
+          $toolsets = @($project.SelectNodes('//msb:PlatformToolset', $namespace))
+          if ($toolsets.Count -ne 4 -or @($toolsets | Where-Object { $_.InnerText -ne 'v145' }).Count -ne 0) {
+            throw 'All four native project configurations must use PlatformToolset v145.'
+          }
+          $windowsSdk = $project.SelectSingleNode('//msb:WindowsTargetPlatformVersion', $namespace).InnerText
+          if ($windowsSdk -ne '10.0') {
+            throw "WindowsTargetPlatformVersion must remain 10.0; found '$windowsSdk'."
+          }
+
+      - name: Build Mono targets
+        shell: pwsh
+        run: ./build.ps1 -MonoOnly
+
+      - name: Verify native exports, PE architecture, and package hashes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $installationPath = & $vswhere -latest -products * -version '[18.0,19.0)' -requires Microsoft.Component.MSBuild Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($installationPath)) {
+            throw 'Could not locate the VS 2026 C++ installation.'
+          }
+
+          $dumpbin = Get-ChildItem -Path (Join-Path $installationPath 'VC/Tools/MSVC/*/bin/Hostx64/x64/dumpbin.exe') |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1
+          if (-not $dumpbin) {
+            throw 'dumpbin.exe was not found in the VS 2026 installation.'
+          }
+
+          $nativeReference = (Resolve-Path 'UnityGraphicsHelper/x64/Release/UnityGraphicsHelper.dll').Path
+          $headers = & $dumpbin.FullName /headers $nativeReference
+          if ($LASTEXITCODE -ne 0 -or ($headers -join "`n") -notmatch '(?im)^\s*8664\s+machine\s+\(x64\)') {
+            throw 'UnityGraphicsHelper.dll is not an x64 PE image.'
+          }
+
+          $escapedNativeReference = $nativeReference.Replace('\', '\\')
+          Add-Type -TypeDefinition @"
+          using System.Runtime.InteropServices;
+          public static class UnityGraphicsHelperAbiProbe
+          {
+              [DllImport("$escapedNativeReference", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+              public static extern int GetUnityGraphicsHelperAbiVersion();
+          }
+          "@
+          $abiVersion = [UnityGraphicsHelperAbiProbe]::GetUnityGraphicsHelperAbiVersion()
+          if ($abiVersion -ne 2) {
+            throw "UnityGraphicsHelper ABI v2 is required; native helper returned v$abiVersion."
+          }
+
+          $exports = & $dumpbin.FullName /exports $nativeReference
+          if ($LASTEXITCODE -ne 0) {
+            throw 'dumpbin export inspection failed.'
+          }
+          $exportText = $exports -join "`n"
+          $bridgeSource = Get-Content -LiteralPath 'src/Features/VRVisualization/OpenXR/NativeBridge.cs' -Raw
+          $entryPoints = @([regex]::Matches($bridgeSource, 'EntryPoint\s*=\s*"(?<name>[^"]+)"') | ForEach-Object { $_.Groups['name'].Value })
+          $requiredExports = @('UnityPluginLoad', 'UnityPluginUnload') + $entryPoints | Sort-Object -Unique
+          foreach ($requiredExport in $requiredExports) {
+            $escapedName = [regex]::Escape($requiredExport)
+            if ($exportText -notmatch "(?m)^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+$escapedName(?:\s|$)") {
+              throw "Required native export '$requiredExport' was not found."
+            }
+          }
+
+          $referenceHash = (Get-FileHash -LiteralPath $nativeReference -Algorithm SHA256).Hash
+          $helperCopies = @('lib/UnityGraphicsHelper.dll') + @(
+            Get-ChildItem -LiteralPath 'Release/OpenXR' -Recurse -File -Filter 'UnityGraphicsHelper.dll' |
+              Select-Object -ExpandProperty FullName
+          )
+          if ($helperCopies.Count -lt 5) {
+            throw "Expected lib plus four OpenXR helper copies; found $($helperCopies.Count)."
+          }
+          foreach ($helperCopy in $helperCopies) {
+            $copyHash = (Get-FileHash -LiteralPath $helperCopy -Algorithm SHA256).Hash
+            if ($copyHash -ne $referenceHash) {
+              throw "Native helper hash mismatch: '$helperCopy' is $copyHash; expected $referenceHash."
+            }
+          }
+
+      - name: Get version name
         shell: pwsh
         run: |
           if ($env:GITHUB_EVENT_NAME -eq 'release') {
-            $version = "${{ github.event.release.tag_name }}"
+            $version = '${{ github.event.release.tag_name }}'
           } else {
-            $version = "ci-${{ github.sha }}"
+            $version = 'ci-${{ github.sha }}'
           }
-          echo "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV
+          "VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      # Step 5: Archive each build configuration into a separate .zip file
-      - name: Archive Builds
+      - name: Archive builds
         shell: pwsh
         run: |
-          Compress-Archive -Path Release/OpenXR/UnityVRMod.BepInEx.IL2CPP/* -DestinationPath UnityVRMod-${{ env.VERSION }}-OpenXR-IL2CPP.zip
-          Compress-Archive -Path Release/OpenXR/UnityVRMod.BepInEx.Mono/* -DestinationPath UnityVRMod-${{ env.VERSION }}-OpenXR-Mono.zip
-          Compress-Archive -Path Release/OpenXR/UnityVRMod.BepInEx5.Mono/* -DestinationPath UnityVRMod-${{ env.VERSION }}-OpenXR-BIE5-Mono.zip
-          Compress-Archive -Path Release/OpenVR/UnityVRMod.BepInEx.IL2CPP/* -DestinationPath UnityVRMod-${{ env.VERSION }}-OpenVR-IL2CPP.zip
-          Compress-Archive -Path Release/OpenVR/UnityVRMod.BepInEx.Mono/* -DestinationPath UnityVRMod-${{ env.VERSION }}-OpenVR-Mono.zip
-          Compress-Archive -Path Release/OpenVR/UnityVRMod.BepInEx5.Mono/* -DestinationPath UnityVRMod-${{ env.VERSION }}-OpenVR-BIE5-Mono.zip
-          
-      # Step 6: If this is a 'release' event, upload the zipped artifacts to the GitHub Release page
-      - name: Upload Assets to Release
+          $ErrorActionPreference = 'Stop'
+          $builds = [ordered]@{
+            'OpenXR-Mono' = 'Release/OpenXR/UnityVRMod.BepInEx.Mono/*'
+            'OpenXR-BIE5-Mono' = 'Release/OpenXR/UnityVRMod.BepInEx5.Mono/*'
+            'OpenVR-Mono' = 'Release/OpenVR/UnityVRMod.BepInEx.Mono/*'
+            'OpenVR-BIE5-Mono' = 'Release/OpenVR/UnityVRMod.BepInEx5.Mono/*'
+          }
+          foreach ($build in $builds.GetEnumerator()) {
+            Compress-Archive -Path $build.Value -DestinationPath "UnityVRMod-${{ env.VERSION }}-$($build.Key).zip"
+          }
+
+      - name: Upload assets to release
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            UnityVRMod-*.zip
+          files: UnityVRMod-*.zip
 
-      # Step 7: If this is just a 'push' to main, upload the zips as temporary build artifacts
-      # This allows for testing and verification without creating a full release.
-      - name: Upload Artifacts for CI
+      - name: Upload CI artifacts
         if: github.event_name == 'push'
         uses: actions/upload-artifact@v4
         with:

@@ -129,7 +129,12 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
     public enum XrActionType { XR_ACTION_TYPE_BOOLEAN_INPUT = 1, XR_ACTION_TYPE_FLOAT_INPUT = 2, XR_ACTION_TYPE_VECTOR2F_INPUT = 3, XR_ACTION_TYPE_POSE_INPUT = 4, XR_ACTION_TYPE_VIBRATION_OUTPUT = 100 }
     public enum XrPassthroughLayerPurposeFB { XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB = 0, XR_PASSTHROUGH_LAYER_PURPOSE_PROJECTED_FB = 1 }
     [Flags] public enum XrSwapchainCreateFlags : ulong { None = 0 }
-    [Flags] public enum XrSwapchainUsageFlags : ulong { XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT = 1, XR_SWAPCHAIN_USAGE_SAMPLED_BIT = 32 }
+    [Flags] public enum XrSwapchainUsageFlags : ulong
+    {
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT = 0x00000001,
+        XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT = 0x00000010,
+        XR_SWAPCHAIN_USAGE_SAMPLED_BIT = 0x00000020
+    }
     [Flags] public enum XrViewStateFlags : ulong { XR_VIEW_STATE_ORIENTATION_VALID_BIT = 1, XR_VIEW_STATE_POSITION_VALID_BIT = 2 }
     [Flags] public enum XrSpaceLocationFlags : ulong
     {
