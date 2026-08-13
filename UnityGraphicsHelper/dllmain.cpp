@@ -1,4 +1,4 @@
-#include "pch.h"
+﻿#include "pch.h"
 #include "framework.h"
 
 #include <Windows.h>
@@ -24,6 +24,27 @@ namespace
 {
     constexpr uint32_t kUnityGraphicsHelperAbiVersion = 2;
     constexpr int kFallbackCopyEventId = 0x53494802; // "SIH" + ABI v2.
+
+    // GPU 完成栅栏自旋上限:远小于托管侧 WaitD3D11CopyBatch 的 2000ms。
+    // 正常两眼拷贝亚毫秒完成;250ms 只用于兜底 GPU 卡死(TDR)。
+    constexpr uint32_t kCopyFenceTimeoutMs = 250;
+
+    inline uint64_t QpcNow()
+    {
+        LARGE_INTEGER counter;
+        QueryPerformanceCounter(&counter);
+        return static_cast<uint64_t>(counter.QuadPart);
+    }
+
+    inline uint64_t QpcTicksPerMs()
+    {
+        static const uint64_t ticks = []() -> uint64_t {
+            LARGE_INTEGER frequency;
+            QueryPerformanceFrequency(&frequency);
+            return static_cast<uint64_t>(frequency.QuadPart) / 1000ull;
+        }();
+        return ticks ? ticks : 1ull;
+    }
 
     // ABI v2 values; keep in sync with NativeCopyBatchStatus in C#.
     enum class CopyBatchStatus : int32_t
@@ -82,6 +103,10 @@ namespace
     std::mutex g_DeviceMutex;
     ID3D11Device* g_D3D11Device = nullptr;
     ID3D11DeviceContext* g_ImmediateContext = nullptr;
+    // GPU 完成栅栏。设备级单例,受 g_DeviceMutex 保护,随设备代际创建/销毁。
+    // 不变式:批次串行执行(ExecuteCopyBatch 持 g_DeviceMutex + OnCopyRenderEvent 的 CAS),
+    // 故单个 query 可安全复用。若未来改为多批次在飞,必须改为每批次独立 query。
+    ID3D11Query* g_CopyFenceQuery = nullptr;
     std::atomic<bool> g_DeviceReady{ false };
     std::atomic<uint64_t> g_DeviceGeneration{ 0 };
     std::atomic<int32_t> g_LastDeviceRemovedReason{ S_OK };
@@ -141,6 +166,12 @@ namespace
             }
         }
 
+        if (g_CopyFenceQuery)
+        {
+            g_CopyFenceQuery->Release();
+            g_CopyFenceQuery = nullptr;
+        }
+
         if (g_ImmediateContext)
         {
             g_ImmediateContext->Release();
@@ -188,6 +219,14 @@ namespace
                 g_LastDeviceRemovedReason.store(S_OK, std::memory_order_release);
                 g_DeviceGeneration.fetch_add(1, std::memory_order_acq_rel);
                 g_DeviceReady.store(true, std::memory_order_release);
+
+                // 尽力预创建 GPU 栅栏 query;失败留待 ExecuteCopyBatch 懒创建兜底。
+                D3D11_QUERY_DESC fenceDesc = {};
+                fenceDesc.Query = D3D11_QUERY_EVENT;
+                if (FAILED(g_D3D11Device->CreateQuery(&fenceDesc, &g_CopyFenceQuery)))
+                {
+                    g_CopyFenceQuery = nullptr;
+                }
             }
 
             deviceChanged = true;
@@ -334,8 +373,81 @@ namespace
         }
 
         // Unity owns the CopyTexture commands. This event is ordered after both
-        // copies and validates the retained resources before OpenXR release.
-        return CopyBatchStatus::Succeeded;
+        // copies. We must not report success until the GPU has actually executed
+        // them, otherwise the OpenXR runtime (Virtual Desktop / NVENC) may read the
+        // swapchain image before the copy completes and crash the display driver.
+        //
+        // 懒创建/恢复 GPU 栅栏 query(InstallGraphicsDevice 时可能未建成)。
+        if (!g_CopyFenceQuery)
+        {
+            D3D11_QUERY_DESC fenceDesc = {};
+            fenceDesc.Query = D3D11_QUERY_EVENT;
+            if (FAILED(g_D3D11Device->CreateQuery(&fenceDesc, &g_CopyFenceQuery)) || !g_CopyFenceQuery)
+            {
+                g_CopyFenceQuery = nullptr;
+
+                // D3D11_QUERY_EVENT 对所有 D3D11 设备均保证支持,非设备移除情形下
+                // 创建失败几乎不可能(OOM 级)。先辨别设备是否已移除。
+                const HRESULT createFailReason = g_D3D11Device->GetDeviceRemovedReason();
+                if (FAILED(createFailReason))
+                {
+                    g_LastDeviceRemovedReason.store(createFailReason, std::memory_order_release);
+                    return CopyBatchStatus::DeviceLost;
+                }
+
+                // 降级:至少推交命令(不等待,残留极罕见竞态),保 VR 可用。
+                g_ImmediateContext->Flush();
+                return CopyBatchStatus::Succeeded;
+            }
+        }
+
+        // EVENT query 只调用 End(不配 Begin)。它排在 Unity 已录入 immediate context
+        // 的两条 CopyTexture 之后。随后显式 Flush 一次推动 GPU 开始执行——本屏障发生在
+        // xrReleaseSwapchainImage / xrEndFrame(Present)之前,不能依赖 Unity 稍后 flush。
+        g_ImmediateContext->End(g_CopyFenceQuery);
+        g_ImmediateContext->Flush();
+
+        const uint64_t deadline = QpcNow() + kCopyFenceTimeoutMs * QpcTicksPerMs();
+        uint32_t spins = 0;
+        for (;;)
+        {
+            BOOL done = FALSE;
+            // 已显式 Flush 过,轮询用 DONOTFLUSH 避免每次重复 flush 的开销。
+            const HRESULT getDataResult = g_ImmediateContext->GetData(
+                g_CopyFenceQuery, &done, sizeof(done), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+
+            if (getDataResult == S_OK)
+            {
+                return CopyBatchStatus::Succeeded; // GPU 已真正执行完两条拷贝
+            }
+            if (FAILED(getDataResult))
+            {
+                return CopyBatchStatus::DeviceLost; // context/device 异常
+            }
+            // getDataResult == S_FALSE:尚未完成,继续等待。
+
+            const HRESULT loopDeviceReason = g_D3D11Device->GetDeviceRemovedReason();
+            if (FAILED(loopDeviceReason))
+            {
+                g_LastDeviceRemovedReason.store(loopDeviceReason, std::memory_order_release);
+                return CopyBatchStatus::DeviceLost;
+            }
+            // 代际无需在循环内复查:全程持有 g_DeviceMutex,换代必先取此锁。
+
+            if (QpcNow() >= deadline)
+            {
+                return CopyBatchStatus::DeviceLost; // GPU 卡死兜底(有上限)
+            }
+
+            if (++spins < 16)
+            {
+                YieldProcessor();  // 前若干次纯 CPU 暂停,GPU 通常微秒级完成
+            }
+            else
+            {
+                SwitchToThread();  // 之后让出时间片给本核就绪线程,无则立即返回
+            }
+        }
     }
 
     void UNITY_INTERFACE_API OnCopyRenderEvent(int eventId, void* data)
