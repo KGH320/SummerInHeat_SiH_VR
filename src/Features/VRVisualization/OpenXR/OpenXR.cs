@@ -280,6 +280,11 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
                 openxrLibHandle = IntPtr.Zero;
                 xrGetInstanceProcAddr_ptr_delegate = null;
             }
+
+            // 库卸载后,OpenXRAPI 中缓存的所有函数指针委托都指向已释放的内存。
+            // 必须全部清空,否则后续任何 "委托 != null" 检查都会放行一次悬空调用,
+            // 导致执行已卸载模块中的地址而使进程崩溃。
+            OpenXRAPI.ResetFunctions();
         }
     }
     #endregion
@@ -344,6 +349,63 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
             xrCreateInstance = GetXrFunction<PFN_xrCreateInstance>(OpenXRConstants.XR_NULL_HANDLE, xrGetInstanceProcAddr_func_ptr);
             xrEnumerateInstanceExtensionProperties = GetXrFunction<PFN_xrEnumerateInstanceExtensionProperties>(OpenXRConstants.XR_NULL_HANDLE, xrGetInstanceProcAddr_func_ptr);
             return true;
+        }
+
+        // openxr_loader.dll 被 FreeLibrary 卸载后,这里缓存的委托全部指向已释放的
+        // 原生内存,任何一次调用都会让进程崩溃在不可执行地址上。卸载库时必须调用
+        // 本方法把它们全部清空,让调用点的 null 检查能真正拦截住后续调用。
+        public static void ResetFunctions()
+        {
+            xrGetInstanceProcAddr_func_ptr = null;
+            xrCreateInstance = null;
+            xrEnumerateInstanceExtensionProperties = null;
+            xrDestroyInstance = null;
+            xrGetSystem = null;
+            xrGetSystemProperties = null;
+            xrGetD3D11GraphicsRequirementsKHR = null;
+            xrCreateSession = null;
+            xrDestroySession = null;
+            xrWaitFrame = null;
+            xrBeginFrame = null;
+            xrEndFrame = null;
+            xrBeginSession = null;
+            xrPollEvent = null;
+            xrStringToPath = null;
+            xrCreateActionSet = null;
+            xrDestroyActionSet = null;
+            xrCreateAction = null;
+            xrDestroyAction = null;
+            xrSuggestInteractionProfileBindings = null;
+            xrAttachSessionActionSets = null;
+            xrSyncActions = null;
+            xrGetActionStateBoolean = null;
+            xrGetActionStateFloat = null;
+            xrGetActionStateVector2f = null;
+            xrCreateActionSpace = null;
+            xrLocateSpace = null;
+            xrEnumerateViewConfigurations = null;
+            xrEnumerateViewConfigurationViews = null;
+            xrEnumerateSwapchainFormats = null;
+            xrCreateSwapchain = null;
+            xrDestroySwapchain = null;
+            xrEnumerateSwapchainImages = null;
+            xrLocateViews = null;
+            xrCreateReferenceSpace = null;
+            xrDestroySpace = null;
+            xrAcquireSwapchainImage = null;
+            xrWaitSwapchainImage = null;
+            xrReleaseSwapchainImage = null;
+            xrEndSession = null;
+            xrApplyHapticFeedback = null;
+            xrStopHapticFeedback = null;
+            xrCreatePassthroughFB = null;
+            xrDestroyPassthroughFB = null;
+            xrPassthroughStartFB = null;
+            xrPassthroughPauseFB = null;
+            xrCreatePassthroughLayerFB = null;
+            xrDestroyPassthroughLayerFB = null;
+            xrPassthroughLayerPauseFB = null;
+            xrPassthroughLayerResumeFB = null;
         }
 
         public static bool InitializeInstanceFunctions(ulong instanceHandle)

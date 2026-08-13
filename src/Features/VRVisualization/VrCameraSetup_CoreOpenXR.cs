@@ -1088,35 +1088,43 @@ namespace UnityVRMod.Features.VrVisualization
             }
         }
 
-        private void DestroyFbPassthrough()
+        private void DestroyFbPassthrough(bool destroyNativeHandles = true)
         {
             _isFbPassthroughEnabled = false;
             _isPassthroughBackgroundColorEnabled = false;
 
+            // destroyNativeHandles=false 用于设备丢失路径:运行时已不可信,
+            // 跳过 xrDestroy* 调用,只清空托管侧句柄。
             if (_fbPassthroughLayer != OpenXRConstants.XR_NULL_HANDLE)
             {
-                try
+                if (destroyNativeHandles)
                 {
-                    OpenXRAPI.xrPassthroughLayerPauseFB?.Invoke(_fbPassthroughLayer);
-                    OpenXRAPI.xrDestroyPassthroughLayerFB?.Invoke(_fbPassthroughLayer);
-                }
-                catch (Exception ex)
-                {
-                    VRModCore.LogWarning($"[OpenXR] Exception while destroying passthrough layer: {ex.Message}");
+                    try
+                    {
+                        OpenXRAPI.xrPassthroughLayerPauseFB?.Invoke(_fbPassthroughLayer);
+                        OpenXRAPI.xrDestroyPassthroughLayerFB?.Invoke(_fbPassthroughLayer);
+                    }
+                    catch (Exception ex)
+                    {
+                        VRModCore.LogWarning($"[OpenXR] Exception while destroying passthrough layer: {ex.Message}");
+                    }
                 }
                 _fbPassthroughLayer = OpenXRConstants.XR_NULL_HANDLE;
             }
 
             if (_fbPassthrough != OpenXRConstants.XR_NULL_HANDLE)
             {
-                try
+                if (destroyNativeHandles)
                 {
-                    OpenXRAPI.xrPassthroughPauseFB?.Invoke(_fbPassthrough);
-                    OpenXRAPI.xrDestroyPassthroughFB?.Invoke(_fbPassthrough);
-                }
-                catch (Exception ex)
-                {
-                    VRModCore.LogWarning($"[OpenXR] Exception while destroying passthrough feature: {ex.Message}");
+                    try
+                    {
+                        OpenXRAPI.xrPassthroughPauseFB?.Invoke(_fbPassthrough);
+                        OpenXRAPI.xrDestroyPassthroughFB?.Invoke(_fbPassthrough);
+                    }
+                    catch (Exception ex)
+                    {
+                        VRModCore.LogWarning($"[OpenXR] Exception while destroying passthrough feature: {ex.Message}");
+                    }
                 }
                 _fbPassthrough = OpenXRConstants.XR_NULL_HANDLE;
             }
@@ -1881,6 +1889,11 @@ namespace UnityVRMod.Features.VrVisualization
 
             var releaseInfo = new XrSwapchainImageReleaseInfo { type = XrStructureType.XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
             _eyeReleaseAttempted[eyeIndex] = true;
+            if (OpenXRAPI.xrReleaseSwapchainImage == null)
+            {
+                RequestOpenXrTeardown($"xrReleaseSwapchainImage(eye={eyeIndex}) unavailable (runtime unloaded).");
+                return false;
+            }
             XrResult releaseResult = OpenXRAPI.xrReleaseSwapchainImage(_eyeSwapchains[eyeIndex], in releaseInfo);
             if (releaseResult < 0)
             {
@@ -1897,6 +1910,11 @@ namespace UnityVRMod.Features.VrVisualization
         private void EndCurrentOpenXrFrame(in XrFrameEndInfo frameEndInfo)
         {
             if (!_openXrFrameInProgress) return;
+            if (OpenXRAPI.xrEndFrame == null)
+            {
+                _openXrFrameInProgress = false;
+                return;
+            }
 
             float endFrameStartTime = Time.realtimeSinceStartup;
             try
@@ -1964,6 +1982,20 @@ namespace UnityVRMod.Features.VrVisualization
             catch (Exception ex)
             {
                 return $"device-removal HRESULT unavailable: {ex.GetType().Name}";
+            }
+        }
+
+        private static bool IsGraphicsDeviceLostForTeardown()
+        {
+            try
+            {
+                // 非 S_OK 表示 D3D11 设备已被移除(TDR/驱动内部错误等)。
+                return NativeBridge.GetLastGraphicsDeviceRemovedReason() != 0;
+            }
+            catch (Exception)
+            {
+                // 查询不到设备状态时按设备正常处理,走常规销毁路径。
+                return false;
             }
         }
 
@@ -4088,19 +4120,19 @@ namespace UnityVRMod.Features.VrVisualization
 
             if (!previousState.HasSample || isActive != previousState.IsActive)
             {
-                VRModCore.Log($"[Input][OpenXR][{handName}] Trigger action {(isActive ? "Active" : "Inactive")}");
+                VRModCore.LogRuntimeDebug($"[Input][OpenXR][{handName}] Trigger action {(isActive ? "Active" : "Inactive")}");
             }
 
             bool triggerEdge = (previousState.HasSample && isPressed != previousState.IsPressed) ||
                                (!previousState.HasSample && isPressed);
             if (triggerEdge)
             {
-                VRModCore.Log($"[Input][OpenXR][{handName}] Trigger {(isPressed ? "Pressed" : "Released")}");
+                VRModCore.LogRuntimeDebug($"[Input][OpenXR][{handName}] Trigger {(isPressed ? "Pressed" : "Released")}");
             }
 
             if (isActive && (!previousState.HasSample || !previousState.IsActive || Mathf.Abs(currentValue - previousState.Value) >= FloatLogDelta))
             {
-                VRModCore.Log($"[Input][OpenXR][{handName}] Trigger value {currentValue:F2}");
+                VRModCore.LogRuntimeDebug($"[Input][OpenXR][{handName}] Trigger value {currentValue:F2}");
             }
 
             previousState = new OpenXrTriggerLogState
@@ -4143,12 +4175,12 @@ namespace UnityVRMod.Features.VrVisualization
 
             if (!previousState.HasSample || isActive != previousState.IsActive)
             {
-                VRModCore.Log($"[Input][OpenXR][{handName}] {actionLabel} action {(isActive ? "Active" : "Inactive")}");
+                VRModCore.LogRuntimeDebug($"[Input][OpenXR][{handName}] {actionLabel} action {(isActive ? "Active" : "Inactive")}");
             }
 
             if (isActive && (!previousState.HasSample || isPressed != previousState.IsPressed))
             {
-                VRModCore.Log($"[Input][OpenXR][{handName}] {actionLabel} {(isPressed ? "Pressed" : "Released")}");
+                VRModCore.LogRuntimeDebug($"[Input][OpenXR][{handName}] {actionLabel} {(isPressed ? "Pressed" : "Released")}");
             }
 
             previousState = new OpenXrBooleanLogState
@@ -4195,7 +4227,7 @@ namespace UnityVRMod.Features.VrVisualization
 
             if (isActive && (!previousState.HasSample || !previousState.IsActive || Mathf.Abs(currentValue - previousState.Value) >= FloatLogDelta))
             {
-                VRModCore.Log($"[Input][OpenXR][{handName}] {actionLabel} value {currentValue:F2}");
+                VRModCore.LogRuntimeDebug($"[Input][OpenXR][{handName}] {actionLabel} value {currentValue:F2}");
             }
 
             previousState = new OpenXrFloatLogState
@@ -4238,7 +4270,7 @@ namespace UnityVRMod.Features.VrVisualization
 
             if (!previousState.HasSample || isActive != previousState.IsActive)
             {
-                VRModCore.Log($"[Input][OpenXR][{handName}] {actionLabel} action {(isActive ? "Active" : "Inactive")}");
+                VRModCore.LogRuntimeDebug($"[Input][OpenXR][{handName}] {actionLabel} action {(isActive ? "Active" : "Inactive")}");
             }
 
             bool axisChanged = !previousState.HasSample ||
@@ -4259,95 +4291,100 @@ namespace UnityVRMod.Features.VrVisualization
             };
         }
 
-        private void TeardownInputActions()
+        private void TeardownInputActions(bool destroyNativeHandles = true)
         {
-            if (_leftAimSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
+            // destroyNativeHandles=false 用于设备丢失路径:运行时已不可信,
+            // 跳过全部 xrDestroy* 调用,只把托管侧的句柄字段清空。
+            if (destroyNativeHandles)
             {
-                OpenXRAPI.xrDestroySpace(_leftAimSpace);
-            }
+                if (_leftAimSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
+                {
+                    OpenXRAPI.xrDestroySpace(_leftAimSpace);
+                }
 
-            if (_leftGripSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
-            {
-                OpenXRAPI.xrDestroySpace(_leftGripSpace);
-            }
+                if (_leftGripSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
+                {
+                    OpenXRAPI.xrDestroySpace(_leftGripSpace);
+                }
 
-            if (_rightGripSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
-            {
-                OpenXRAPI.xrDestroySpace(_rightGripSpace);
-            }
+                if (_rightGripSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
+                {
+                    OpenXRAPI.xrDestroySpace(_rightGripSpace);
+                }
 
-            if (_rightAimSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
-            {
-                OpenXRAPI.xrDestroySpace(_rightAimSpace);
-            }
+                if (_rightAimSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
+                {
+                    OpenXRAPI.xrDestroySpace(_rightAimSpace);
+                }
 
-            if (_bClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_bClickAction);
-            }
+                if (_bClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_bClickAction);
+                }
 
-            if (_xClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_xClickAction);
-            }
-            if (_yClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_yClickAction);
-            }
+                if (_xClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_xClickAction);
+                }
+                if (_yClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_yClickAction);
+                }
 
-            if (_leftAimPoseAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_leftAimPoseAction);
-            }
+                if (_leftAimPoseAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_leftAimPoseAction);
+                }
 
-            if (_aClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_aClickAction);
-            }
+                if (_aClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_aClickAction);
+                }
 
-            if (_rightAimPoseAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_rightAimPoseAction);
-            }
+                if (_rightAimPoseAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_rightAimPoseAction);
+                }
 
-            if (_rightGripPoseAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_rightGripPoseAction);
-            }
+                if (_rightGripPoseAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_rightGripPoseAction);
+                }
 
-            if (_leftGripPoseAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_leftGripPoseAction);
-            }
+                if (_leftGripPoseAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_leftGripPoseAction);
+                }
 
-            if (_thumbstickClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_thumbstickClickAction);
-            }
+                if (_thumbstickClickAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_thumbstickClickAction);
+                }
 
-            if (_thumbstickAxisAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_thumbstickAxisAction);
-            }
+                if (_thumbstickAxisAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_thumbstickAxisAction);
+                }
 
-            if (_gripValueAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_gripValueAction);
-            }
+                if (_gripValueAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_gripValueAction);
+                }
 
-            if (_hapticAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_hapticAction);
-            }
+                if (_hapticAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_hapticAction);
+                }
 
-            if (_triggerValueAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
-            {
-                OpenXRAPI.xrDestroyAction(_triggerValueAction);
-            }
+                if (_triggerValueAction != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyAction != null)
+                {
+                    OpenXRAPI.xrDestroyAction(_triggerValueAction);
+                }
 
-            if (_inputActionSet != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyActionSet != null)
-            {
-                OpenXRAPI.xrDestroyActionSet(_inputActionSet);
+                if (_inputActionSet != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyActionSet != null)
+                {
+                    OpenXRAPI.xrDestroyActionSet(_inputActionSet);
+                }
             }
 
             _bClickAction = OpenXRConstants.XR_NULL_HANDLE;
@@ -5220,26 +5257,45 @@ namespace UnityVRMod.Features.VrVisualization
 
             try
             {
-                bool swapchainImagesReady = PrepareSwapchainImagesForTeardown();
-                SafeEndOpenXrFrameAfterException();
-
-                if (_pendingCopyTicket != 0 || _openXrFrameInProgress || !swapchainImagesReady)
+                // 设备丢失后 OpenXR 运行时(如 virtualdesktop-openxr)内部状态已不可信,
+                // 继续调用 xrEndSession/xrDestroy* 可能在运行时内部二次崩溃(用户崩溃
+                // 转储已证实)。此时跳过全部 xr 运行时调用,只回收托管状态与句柄字段。
+                bool skipXrRuntimeCalls = IsGraphicsDeviceLostForTeardown();
+                if (skipXrRuntimeCalls)
                 {
                     if (!_hasLoggedDeferredTeardown)
+                        VRModCore.LogWarning("[OpenXR] Graphics device lost; skipping all OpenXR runtime calls during teardown.");
+
+                    // 设备已丢失,不存在仍需等待的 GPU 工作:排空并释放 native 票据即可。
+                    if (_pendingCopyTicket != 0) DrainPendingCopyBatch();
+                    ReleasePendingCopyBatch();
+                    _openXrFrameInProgress = false;
+                    _isSessionRunning = false;
+                }
+                else
+                {
+                    bool swapchainImagesReady = PrepareSwapchainImagesForTeardown();
+                    SafeEndOpenXrFrameAfterException();
+
+                    if (_pendingCopyTicket != 0 || _openXrFrameInProgress || !swapchainImagesReady)
                     {
-                        _hasLoggedDeferredTeardown = true;
-                        VRModCore.LogWarning(
-                            "[OpenXR] Deferring teardown until pending copy/frame/swapchain work is safe to release.");
+                        if (!_hasLoggedDeferredTeardown)
+                        {
+                            _hasLoggedDeferredTeardown = true;
+                            VRModCore.LogWarning(
+                                "[OpenXR] Deferring teardown until pending copy/frame/swapchain work is safe to release.");
+                        }
+                        _teardownRequested = true;
+                        return;
                     }
-                    _teardownRequested = true;
-                    return;
+
+                    EndStoppingOpenXrSessionForTeardown();
                 }
 
-                EndStoppingOpenXrSessionForTeardown();
                 RestorePassthroughManagedCameraState();
                 TeardownCameraRig();
-                TeardownInputActions();
-                DestroyFbPassthrough();
+                TeardownInputActions(!skipXrRuntimeCalls);
+                DestroyFbPassthrough(!skipXrRuntimeCalls);
 
                 if (_pProjectionLayerViews != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayerViews); _pProjectionLayerViews = IntPtr.Zero; }
                 if (_pProjectionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pProjectionLayer); _pProjectionLayer = IntPtr.Zero; }
@@ -5247,29 +5303,35 @@ namespace UnityVRMod.Features.VrVisualization
                 if (_pLayersForSubmit != IntPtr.Zero) { Marshal.FreeHGlobal(_pLayersForSubmit); _pLayersForSubmit = IntPtr.Zero; }
 
                 DestroySwapchainTextureWrappers();
-                foreach (ulong sc in _eyeSwapchains)
+                if (!skipXrRuntimeCalls)
                 {
-                    if (sc != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySwapchain != null)
-                        LogOpenXrTeardownResult("xrDestroySwapchain", OpenXRAPI.xrDestroySwapchain(sc));
+                    foreach (ulong sc in _eyeSwapchains)
+                    {
+                        if (sc != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySwapchain != null)
+                            LogOpenXrTeardownResult("xrDestroySwapchain", OpenXRAPI.xrDestroySwapchain(sc));
+                    }
                 }
                 _eyeSwapchains.Clear();
                 _eyeSwapchainImages.Clear();
 
-                if (_appSpace != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySpace != null)
+                if (_appSpace != OpenXRConstants.XR_NULL_HANDLE)
                 {
-                    LogOpenXrTeardownResult("xrDestroySpace(app)", OpenXRAPI.xrDestroySpace(_appSpace));
+                    if (!skipXrRuntimeCalls && OpenXRAPI.xrDestroySpace != null)
+                        LogOpenXrTeardownResult("xrDestroySpace(app)", OpenXRAPI.xrDestroySpace(_appSpace));
                     _appSpace = OpenXRConstants.XR_NULL_HANDLE;
                 }
 
-                if (_xrSession != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySession != null)
+                if (_xrSession != OpenXRConstants.XR_NULL_HANDLE)
                 {
-                    LogOpenXrTeardownResult("xrDestroySession", OpenXRAPI.xrDestroySession(_xrSession));
+                    if (!skipXrRuntimeCalls && OpenXRAPI.xrDestroySession != null)
+                        LogOpenXrTeardownResult("xrDestroySession", OpenXRAPI.xrDestroySession(_xrSession));
                     _xrSession = OpenXRConstants.XR_NULL_HANDLE;
                 }
 
-                if (_xrInstance != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroyInstance != null)
+                if (_xrInstance != OpenXRConstants.XR_NULL_HANDLE)
                 {
-                    LogOpenXrTeardownResult("xrDestroyInstance", OpenXRAPI.xrDestroyInstance(_xrInstance));
+                    if (!skipXrRuntimeCalls && OpenXRAPI.xrDestroyInstance != null)
+                        LogOpenXrTeardownResult("xrDestroyInstance", OpenXRAPI.xrDestroyInstance(_xrInstance));
                     _xrInstance = OpenXRConstants.XR_NULL_HANDLE;
                 }
 
@@ -5341,7 +5403,11 @@ namespace UnityVRMod.Features.VrVisualization
         private bool PrepareSwapchainImagesForTeardown()
         {
             if (_pendingCopyTicket != 0) DrainPendingCopyBatch();
-            if (_xrSession == OpenXRConstants.XR_NULL_HANDLE) return _pendingCopyTicket == 0;
+            if (_xrSession == OpenXRConstants.XR_NULL_HANDLE ||
+                OpenXRAPI.xrWaitSwapchainImage == null)
+            {
+                return _pendingCopyTicket == 0;
+            }
 
             bool shouldRetrySwapchainWait = false;
 
