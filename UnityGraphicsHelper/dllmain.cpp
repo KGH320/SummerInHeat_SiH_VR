@@ -333,9 +333,8 @@ namespace
             return CopyBatchStatus::InvalidResource;
         }
 
-        // Unity's command buffer owns the actual CopyTexture operations. This
-        // callback is ordered after them and only validates the retained D3D11
-        // resources before allowing the OpenXR images to be released.
+        // Unity owns the CopyTexture commands. This event is ordered after both
+        // copies and validates the retained resources before OpenXR release.
         return CopyBatchStatus::Succeeded;
     }
 
@@ -655,69 +654,10 @@ extern "C" __declspec(dllexport) void ReleaseD3D11CopyBatch(uint64_t ticket)
     }
 }
 
-// Legacy exports retained for existing packages. ABI v2 callers must use the
-// render-event copy batch path above.
-extern "C" __declspec(dllexport) void SetDevicePointerFromCSharp(void* deviceFromCSharp)
-{
-    if (deviceFromCSharp)
-    {
-        InstallGraphicsDevice(static_cast<ID3D11Device*>(deviceFromCSharp));
-    }
-    else
-    {
-        ClearGraphicsDevice();
-    }
-}
-
 extern "C" UNITY_INTERFACE_EXPORT void* UNITY_INTERFACE_API GetD3D11Device()
 {
     std::lock_guard<std::mutex> lock(g_DeviceMutex);
     return g_D3D11Device;
-}
-
-extern "C" __declspec(dllexport) void* GetDeviceFromResource(void* resourcePointer)
-{
-    if (!resourcePointer)
-    {
-        return nullptr;
-    }
-
-    ID3D11Resource* resource = static_cast<ID3D11Resource*>(resourcePointer);
-    ID3D11Device* resourceDevice = nullptr;
-    resource->GetDevice(&resourceDevice);
-    if (!resourceDevice)
-    {
-        return nullptr;
-    }
-
-    // Preserve the legacy borrowed-pointer contract without leaking the
-    // reference returned by ID3D11Resource::GetDevice.
-    void* result = resourceDevice;
-    resourceDevice->Release();
-    return result;
-}
-
-extern "C" __declspec(dllexport) void DirectCopyResource(void* destination, void* source)
-{
-    if (!destination || !source)
-    {
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(g_DeviceMutex);
-    if (!g_DeviceReady.load(std::memory_order_acquire) || !g_D3D11Device || !g_ImmediateContext)
-    {
-        return;
-    }
-
-    CopyOperation operation = {
-        static_cast<ID3D11Resource*>(destination),
-        static_cast<ID3D11Resource*>(source)
-    };
-    if (ValidateCopyOperation(operation, g_D3D11Device))
-    {
-        g_ImmediateContext->CopyResource(operation.destination, operation.source);
-    }
 }
 
 extern "C" __declspec(dllexport) HRESULT CreateAndRegisterSRV(
@@ -758,8 +698,20 @@ extern "C" __declspec(dllexport) HRESULT CreateAndRegisterSRV(
     D3D11_TEXTURE2D_DESC textureDescription = {};
     texture->GetDesc(&textureDescription);
 
+    const DXGI_FORMAT srvFormat = static_cast<DXGI_FORMAT>(srvFormatDXGI);
+    if (!ResourceBelongsToDevice(texture, device) ||
+        (textureDescription.BindFlags & D3D11_BIND_SHADER_RESOURCE) == 0 ||
+        textureDescription.SampleDesc.Count != 1 ||
+        textureDescription.ArraySize != 1 ||
+        !AreFormatsCopyCompatible(textureDescription.Format, srvFormat))
+    {
+        texture->Release();
+        device->Release();
+        return E_INVALIDARG;
+    }
+
     D3D11_SHADER_RESOURCE_VIEW_DESC srvDescription = {};
-    srvDescription.Format = static_cast<DXGI_FORMAT>(srvFormatDXGI);
+    srvDescription.Format = srvFormat;
     srvDescription.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     srvDescription.Texture2D.MostDetailedMip = 0;
     srvDescription.Texture2D.MipLevels = textureDescription.MipLevels == 0

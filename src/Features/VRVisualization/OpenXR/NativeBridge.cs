@@ -58,6 +58,12 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
         [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ReleaseD3D11CopyBatch")]
         public static extern void ReleaseD3D11CopyBatch(ulong ticket);
 
+        [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "CreateAndRegisterSRV")]
+        public static extern int CreateAndRegisterSRV(IntPtr textureResource, int srvFormatDxgi, out IntPtr srv);
+
+        [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ReleaseNativeObject")]
+        public static extern void ReleaseNativeObject(IntPtr nativeObject);
+
         [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "GetD3D11Device")]
         private static extern IntPtr GetCachedD3D11Device_Internal();
 

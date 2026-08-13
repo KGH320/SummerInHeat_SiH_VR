@@ -26,6 +26,7 @@ namespace UnityVRMod.Features.VrVisualization
             !_openXrFrameInProgress &&
             _eyeSwapchains.Count == 0 &&
             _eyeSwapchainTextures.Count == 0 &&
+            _eyeSwapchainSrvs.Count == 0 &&
             _copyCommandBuffer == null &&
             _vrRig == null;
 
@@ -41,6 +42,7 @@ namespace UnityVRMod.Features.VrVisualization
         private long _selectedSwapchainFormat = 0;
         private readonly List<ulong> _eyeSwapchains = [];
         private readonly List<List<IntPtr>> _eyeSwapchainImages = [];
+        private readonly List<List<IntPtr>> _eyeSwapchainSrvs = [];
         private readonly List<List<Texture2D>> _eyeSwapchainTextures = [];
         private ulong _appSpace = OpenXRConstants.XR_NULL_HANDLE;
         private bool _isSessionRunning = false;
@@ -1253,6 +1255,7 @@ namespace UnityVRMod.Features.VrVisualization
                 {
                     type = XrStructureType.XR_TYPE_SWAPCHAIN_CREATE_INFO,
                     usageFlags = XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+                                 XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
                                  XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
                     format = _selectedSwapchainFormat,
                     sampleCount = 1,
@@ -1268,6 +1271,7 @@ namespace UnityVRMod.Features.VrVisualization
 
                 IntPtr scImagesPtr = IntPtr.Zero;
                 List<IntPtr> currentEyeTexList = [];
+                List<IntPtr> currentEyeSrvList = [];
                 List<Texture2D> currentEyeUnityTextures = [];
                 try
                 {
@@ -1291,21 +1295,31 @@ namespace UnityVRMod.Features.VrVisualization
                         if (swapchainImage.texture == IntPtr.Zero)
                             throw new Exception($"OpenXR returned a null D3D11 texture for eye {i}, image {j}.");
                         currentEyeTexList.Add(swapchainImage.texture);
+
+                        int srvResult = NativeBridge.CreateAndRegisterSRV(
+                            swapchainImage.texture,
+                            checked((int)_selectedSwapchainFormat),
+                            out IntPtr srv);
+                        if (srvResult < 0 || srv == IntPtr.Zero)
+                            throw new Exception($"Failed to create a D3D11 SRV for eye {i}, image {j}: HRESULT 0x{unchecked((uint)srvResult):X8}.");
+                        currentEyeSrvList.Add(srv);
+
                         Texture2D externalTexture = Texture2D.CreateExternalTexture(
                             (int)view.recommendedImageRectWidth,
                             (int)view.recommendedImageRectHeight,
                             TextureFormat.BGRA32,
                             false,
                             _selectedSwapchainFormat != DxgiFormatB8G8R8A8UnormSrgb,
-                            swapchainImage.texture);
+                            srv);
                         if (externalTexture == null)
-                            throw new Exception($"Unity failed to wrap the OpenXR texture for eye {i}, image {j}.");
+                            throw new Exception($"Unity failed to wrap the OpenXR SRV for eye {i}, image {j}.");
                         externalTexture.name = $"OpenXR_Eye{i}_SwapchainImage{j}";
                         currentEyeUnityTextures.Add(externalTexture);
                     }
 
                     _eyeSwapchains.Add(scHandle);
                     _eyeSwapchainImages.Add(currentEyeTexList);
+                    _eyeSwapchainSrvs.Add(currentEyeSrvList);
                     _eyeSwapchainTextures.Add(currentEyeUnityTextures);
                     scHandle = OpenXRConstants.XR_NULL_HANDLE;
                 }
@@ -1314,8 +1328,7 @@ namespace UnityVRMod.Features.VrVisualization
                     if (scImagesPtr != IntPtr.Zero) Marshal.FreeHGlobal(scImagesPtr);
                     if (scHandle != OpenXRConstants.XR_NULL_HANDLE)
                     {
-                        foreach (Texture2D texture in currentEyeUnityTextures)
-                            if (texture != null) UnityEngine.Object.Destroy(texture);
+                        DestroySwapchainTextureWrappers(currentEyeUnityTextures, currentEyeSrvList);
                     }
                     if (scHandle != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySwapchain != null)
                         OpenXRAPI.xrDestroySwapchain(scHandle);
@@ -1327,14 +1340,40 @@ namespace UnityVRMod.Features.VrVisualization
 
         private void DestroySwapchainTextureWrappers()
         {
-            foreach (List<Texture2D> eyeTextures in _eyeSwapchainTextures)
+            int eyeCount = Math.Max(_eyeSwapchainTextures.Count, _eyeSwapchainSrvs.Count);
+            for (int eye = 0; eye < eyeCount; eye++)
             {
-                foreach (Texture2D texture in eyeTextures)
-                {
-                    if (texture != null) UnityEngine.Object.Destroy(texture);
-                }
+                List<Texture2D> textures = eye < _eyeSwapchainTextures.Count
+                    ? _eyeSwapchainTextures[eye]
+                    : null;
+                List<IntPtr> srvs = eye < _eyeSwapchainSrvs.Count
+                    ? _eyeSwapchainSrvs[eye]
+                    : null;
+                DestroySwapchainTextureWrappers(textures, srvs);
             }
             _eyeSwapchainTextures.Clear();
+            _eyeSwapchainSrvs.Clear();
+        }
+
+        private static void DestroySwapchainTextureWrappers(List<Texture2D> textures, List<IntPtr> srvs)
+        {
+            if (textures != null)
+            {
+                foreach (Texture2D texture in textures)
+                {
+                    if (texture != null) UnityEngine.Object.DestroyImmediate(texture);
+                }
+                textures.Clear();
+            }
+
+            if (srvs != null)
+            {
+                foreach (IntPtr srv in srvs)
+                {
+                    if (srv != IntPtr.Zero) NativeBridge.ReleaseNativeObject(srv);
+                }
+                srvs.Clear();
+            }
         }
 
         public void UpdatePoses()
