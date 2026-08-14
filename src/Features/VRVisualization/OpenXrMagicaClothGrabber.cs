@@ -11,8 +11,9 @@ namespace UnityVRMod.Features.VrVisualization
         private const string HarmonyId = "com.newunitymodder.unityvrmod.openxrmagicaclothgrab";
         private const float GripPressThreshold = 0.65f;
         private const float GripReleaseThreshold = 0.45f;
-        private const float GrabTransitionSeconds = 0.06f;
-        private const float MaxTargetStepMeters = 0.08f;
+        private const float GrabDampingSmoothTimeSeconds = 0.05f;
+        private const float MaxTargetSpeedMetersPerSecond = 4.0f;
+        private const float MaxDampingDeltaTimeSeconds = 0.05f;
         private const float AutoReleaseDistanceMeters = 0.35f;
         private const float ReleaseVelocityScale = 0.35f;
         private const float MaxReleaseVelocityMetersPerSecond = 1.2f;
@@ -208,7 +209,7 @@ namespace UnityVRMod.Features.VrVisualization
                     hand.PendingCapture = true;
                     hand.PendingCaptureTime = now;
                     hand.PendingCaptureWarningLogged = false;
-                    VRModCore.Log(
+                    VRModCore.LogRuntimeDebug(
                         $"[Physics][OpenXR][MagicaGrab] {hand.Name} Grip press queued, value={gripValue:F2}, "
                         + $"anchor=({hand.Position.x:F3},{hand.Position.y:F3},{hand.Position.z:F3}), probes={hand.ProbeCount}.");
                 }
@@ -354,7 +355,7 @@ namespace UnityVRMod.Features.VrVisualization
                     _harmony.Patch(clothUpdate, prefix: new HarmonyMethod(prefix));
                     _harmony.Patch(earlyClothUpdate, postfix: new HarmonyMethod(postfix));
                     _hooksInstalled = true;
-                    VRModCore.Log("[Physics][OpenXR][MagicaGrab] Installed MagicaCloth2 safe-timing hooks.");
+                    VRModCore.LogRuntimeDebug("[Physics][OpenXR][MagicaGrab] Installed MagicaCloth2 safe-timing hooks.");
                 }
 
                 _bindingsResolved = true;
@@ -605,14 +606,13 @@ namespace UnityVRMod.Features.VrVisualization
 
             if (hand.Particles.Count > 0)
             {
-                hand.CaptureTime = Time.unscaledTime;
                 hand.SuppressUntilGripRelease = true;
             }
 
             string nearestDistance = float.IsPositiveInfinity(nearestMovableDistanceSquared)
                 ? "none"
                 : Mathf.Sqrt(nearestMovableDistanceSquared).ToString("F3") + "m";
-            VRModCore.Log(
+            VRModCore.LogRuntimeDebug(
                 $"[Physics][OpenXR][MagicaGrab] {hand.Name} capture scan: cloths={cloths.Length}, "
                 + $"teams={resolvedTeamCount}, valid={validTeamCount}, enabled={enabledTeamCount}, running={runningTeamCount}, "
                 + $"particles={scannedParticleCount}, movable={movableParticleCount}, probes={hand.ProbeCount + 1}, "
@@ -719,17 +719,14 @@ namespace UnityVRMod.Features.VrVisualization
 
                 particle.ResolvedParticleIndex = particleIndex;
                 particle.ResolvedProxyIndex = proxyIndex;
-                particle.CurrentPosition = currentPosition;
                 particle.HardTarget = hardTarget;
             }
 
-            float transition = Mathf.Clamp01((Time.unscaledTime - hand.CaptureTime) / GrabTransitionSeconds);
             object zero = CreateFloat3(Vector3.zero);
             for (int i = 0; i < hand.Particles.Count; i++)
             {
                 GrabbedParticle particle = hand.Particles[i];
-                Vector3 target = Vector3.Lerp(particle.CapturePosition, particle.HardTarget, transition);
-                target = Vector3.MoveTowards(particle.CurrentPosition, target, MaxTargetStepMeters);
+                Vector3 target = UpdateDampedTarget(particle);
                 object targetValue = CreateFloat3(target);
 
                 _float3ArrayAccessor.Set(buffers.NextPos, particle.ResolvedParticleIndex, targetValue);
@@ -741,6 +738,37 @@ namespace UnityVRMod.Features.VrVisualization
                 _float3ArrayAccessor.Set(buffers.Velocity, particle.ResolvedParticleIndex, zero);
                 _float3ArrayAccessor.Set(buffers.RealVelocity, particle.ResolvedParticleIndex, zero);
             }
+        }
+
+        private static Vector3 UpdateDampedTarget(GrabbedParticle particle)
+        {
+            int frame = Time.frameCount;
+            if (particle.LastDampingFrame == frame)
+            {
+                return particle.DampedTarget;
+            }
+
+            float now = Time.unscaledTime;
+            float deltaTime = particle.LastDampingTime >= 0f
+                ? now - particle.LastDampingTime
+                : Time.unscaledDeltaTime;
+            particle.LastDampingFrame = frame;
+            particle.LastDampingTime = now;
+
+            if (deltaTime <= 0f)
+            {
+                return particle.DampedTarget;
+            }
+
+            deltaTime = Mathf.Min(deltaTime, MaxDampingDeltaTimeSeconds);
+            particle.DampedTarget = Vector3.SmoothDamp(
+                particle.DampedTarget,
+                particle.HardTarget,
+                ref particle.DampedVelocity,
+                GrabDampingSmoothTimeSeconds,
+                MaxTargetSpeedMetersPerSecond,
+                deltaTime);
+            return particle.DampedTarget;
         }
 
         private bool TryResolveParticle(
@@ -1048,7 +1076,6 @@ namespace UnityVRMod.Features.VrVisualization
             public Vector3 PreviousPosition;
             public float PreviousPoseTime;
             public Vector3 Velocity;
-            public float CaptureTime;
             public float PendingCaptureTime;
             public int ProbeCount;
         }
@@ -1065,19 +1092,21 @@ namespace UnityVRMod.Features.VrVisualization
                 TeamId = teamId;
                 LocalIndex = localIndex;
                 OwnershipKey = ownershipKey;
-                CapturePosition = capturePosition;
                 LocalOffset = localOffset;
+                DampedTarget = capturePosition;
             }
 
             public int TeamId { get; }
             public int LocalIndex { get; }
             public long OwnershipKey { get; }
-            public Vector3 CapturePosition { get; }
             public Vector3 LocalOffset { get; }
             public int ResolvedParticleIndex;
             public int ResolvedProxyIndex;
-            public Vector3 CurrentPosition;
             public Vector3 HardTarget;
+            public Vector3 DampedTarget;
+            public Vector3 DampedVelocity;
+            public int LastDampingFrame = -1;
+            public float LastDampingTime = -1f;
         }
 
         private readonly struct ParticleCandidate

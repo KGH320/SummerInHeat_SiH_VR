@@ -287,7 +287,7 @@ namespace UnityVRMod.Config
                 "[OpenXR ONLY] Particle search radius in meters for the experimental MagicaCloth2 Grip grab.", 0.075f);
 
             OpenXR_MagicaClothGrabMaxParticles = new ConfigElement<int>("OpenXR MagicaCloth Grab Max Particles",
-                "[OpenXR ONLY] Maximum movable MagicaCloth2 particles captured by each hand.", 4);
+                "[OpenXR ONLY] Maximum movable MagicaCloth2 particles captured by each hand.", 2);
 
             OpenXR_ForceDefaultRenderScenes = new ConfigElement<string>("OpenXR Force Default Render Scenes",
                 "[OpenXR ONLY] Forces safe default VR eye-camera render state in specific scenes to avoid artifacts from copied main-camera settings. Format: 'SceneNameA;SceneNameB;'.", "");

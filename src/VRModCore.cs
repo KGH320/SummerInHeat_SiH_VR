@@ -13,7 +13,7 @@ namespace UnityVRMod.Core
     {
         public const string GUID = "com.newunitymodder.unityvrmod";
         public const string MOD_NAME = "Unity VR Mod";
-        public const string VERSION = "1.9.2";
+        public const string VERSION = "1.10.0";
         public const string AUTHOR = "New Unity Modder";
 
         public static IVRModLoader Loader { get; private set; }
