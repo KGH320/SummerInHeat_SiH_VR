@@ -323,7 +323,7 @@ namespace UnityVRMod.Config
                 "The time (in seconds) that automatic safe mode will remain active.", 1.0f);
 
             EnableRuntimeDebugLogging = new ConfigElement<bool>("Enable Runtime Debug Logging",
-                "Enables detailed, non-spammy debug messages to be printed to the console.", false);
+                "Enables high-cost runtime diagnostics. Debug messages require Log Level = Debug to be emitted.", false);
 
             AssertedCameraOverrides = new ConfigElement<string>("Asserted Camera Overrides",
                 "Manual overrides for camera detection if heuristics fail. Format: 'SceneName|GameObjectPath;GameObjectPath2'. Use full hierarchy or just the name. An empty scene name applies the override to all scenes.",
@@ -335,7 +335,7 @@ namespace UnityVRMod.Config
         private static void CreateLoggingConfigElement()
         {
             LogLevel = new ConfigElement<ModLogLevel>("Log Level",
-                "Controls Unity VR Mod log output. Off disables all mod logs; Error logs only errors; Warning logs warnings and errors; Info logs normal messages, warnings, and errors.", ModLogLevel.Warning);
+                "Controls Unity VR Mod log output. Off disables all mod logs; Error logs only errors; Warning logs warnings and errors; Info includes normal messages; Debug includes all debug messages.", ModLogLevel.Warning);
         }
 
         public static void SaveAll()

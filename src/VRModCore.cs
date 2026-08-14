@@ -117,10 +117,17 @@ namespace UnityVRMod.Core
             LogImpl(message, logType, "UniverseLib", "", 0);
         }
 
-        private static void LogImpl(object message, UnityEngine.LogType logType, string callerName, string callerFile, int callerLine)
+        private static void LogImpl(
+            object message,
+            UnityEngine.LogType logType,
+            string callerName,
+            string callerFile,
+            int callerLine,
+            bool isDebugMessage = false)
         {
             if (Loader == null || message == null) return;
-            if (!ShouldLog(logType)) return;
+            ModLogLevel messageLogLevel = isDebugMessage ? ModLogLevel.Debug : GetMessageLogLevel(logType);
+            if (!ShouldLog(messageLogLevel)) return;
 
             string messageStr = message.ToString();
             string formattedMessage;
@@ -128,7 +135,8 @@ namespace UnityVRMod.Core
 #if DEBUG
             bool isDebug = true;
 #else
-            bool isDebug = ConfigManager.EnableRuntimeDebugLogging?.Value ?? false;
+            bool isDebug = (ConfigManager.EnableRuntimeDebugLogging?.Value ?? false)
+                || (ConfigManager.LogLevel?.Value == ModLogLevel.Debug);
 #endif
 
             if (isDebug)
@@ -141,6 +149,12 @@ namespace UnityVRMod.Core
             else
             {
                 formattedMessage = $"[{Path.GetFileNameWithoutExtension(callerFile)}] {messageStr}";
+            }
+
+            if (isDebugMessage)
+            {
+                Loader.LogDebug(formattedMessage);
+                return;
             }
 
             switch (logType)
@@ -159,12 +173,12 @@ namespace UnityVRMod.Core
             }
         }
 
-        private static bool ShouldLog(UnityEngine.LogType logType)
+        private static bool ShouldLog(ModLogLevel messageLogLevel)
         {
             ModLogLevel configuredLevel = ConfigManager.LogLevel?.Value ?? ModLogLevel.Info;
             if (configuredLevel == ModLogLevel.Off) return false;
 
-            return GetMessageLogLevel(logType) <= configuredLevel;
+            return messageLogLevel <= configuredLevel;
         }
 
         private static ModLogLevel GetMessageLogLevel(UnityEngine.LogType logType)
@@ -201,20 +215,13 @@ namespace UnityVRMod.Core
 
         public static void LogRuntimeDebug(object message, [CallerMemberName] string callerName = "", [CallerFilePath] string callerFile = "", [CallerLineNumber] int callerLine = 0)
         {
-#if DEBUG
-            LogImpl($"[DEBUG] {message}", UnityEngine.LogType.Log, callerName, callerFile, callerLine);
-#else
-            if (ConfigManager.EnableRuntimeDebugLogging?.Value ?? false)
-            {
-                LogImpl($"[DEBUG] {message}", UnityEngine.LogType.Log, callerName, callerFile, callerLine);
-            }
-#endif
+            LogImpl($"[DEBUG] {message}", UnityEngine.LogType.Log, callerName, callerFile, callerLine, isDebugMessage: true);
         }
 
         [Conditional("ENABLE_VDEBUG_LOGGING")]
         public static void LogSpammyDebug(object message, [CallerMemberName] string callerName = "", [CallerFilePath] string callerFile = "", [CallerLineNumber] int callerLine = 0)
         {
-            LogImpl($"[VDEBUG] {message}", UnityEngine.LogType.Log, callerName, callerFile, callerLine);
+            LogImpl($"[VDEBUG] {message}", UnityEngine.LogType.Log, callerName, callerFile, callerLine, isDebugMessage: true);
         }
         #endregion
     }
