@@ -12,6 +12,9 @@ namespace UnityVRMod.Features.VrVisualization
 {
     internal class VrCameraSetup_CoreOpenXR : IVrCameraSetup
     {
+        private const long DxgiFormatB8G8R8A8Unorm = 87;
+        private const long DxgiFormatB8G8R8A8UnormSrgb = 91;
+
         private ulong _xrInstance = OpenXRConstants.XR_NULL_HANDLE;
         private ulong _xrSystemId = OpenXRConstants.XR_NULL_SYSTEM_ID;
         private ulong _xrSession = OpenXRConstants.XR_NULL_HANDLE;
@@ -25,8 +28,6 @@ namespace UnityVRMod.Features.VrVisualization
             _pendingCopyTicket == 0 &&
             !_openXrFrameInProgress &&
             _eyeSwapchains.Count == 0 &&
-            _eyeSwapchainTextures.Count == 0 &&
-            _eyeSwapchainSrvs.Count == 0 &&
             _copyCommandBuffer == null &&
             _vrRig == null;
 
@@ -40,10 +41,9 @@ namespace UnityVRMod.Features.VrVisualization
 
         private readonly List<long> _supportedSwapchainFormats = [];
         private long _selectedSwapchainFormat = 0;
+        private bool _swapchainFormatFallbackActive;
         private readonly List<ulong> _eyeSwapchains = [];
         private readonly List<List<IntPtr>> _eyeSwapchainImages = [];
-        private readonly List<List<IntPtr>> _eyeSwapchainSrvs = [];
-        private readonly List<List<Texture2D>> _eyeSwapchainTextures = [];
         private ulong _appSpace = OpenXRConstants.XR_NULL_HANDLE;
         private bool _isSessionRunning = false;
         private XrReferenceSpaceType _appSpaceType = XrReferenceSpaceType.XR_REFERENCE_SPACE_TYPE_LOCAL;
@@ -65,6 +65,10 @@ namespace UnityVRMod.Features.VrVisualization
         private RenderTexture _rightEyeIntermediateRT = null;
         private RenderTexture _leftEyePassthroughAlphaFixedRT = null;
         private RenderTexture _rightEyePassthroughAlphaFixedRT = null;
+        private RenderTexture _leftEyeFormatConversionRT = null;
+        private RenderTexture _rightEyeFormatConversionRT = null;
+        private RenderTexture _leftEyeGammaDecodeStagingRT = null;
+        private RenderTexture _rightEyeGammaDecodeStagingRT = null;
         private Material _passthroughAlphaFixMaterial;
         private object _passthroughAlphaFixAssetBundle;
         private MethodInfo _passthroughAlphaFixAssetBundleUnloadMethod;
@@ -294,10 +298,10 @@ namespace UnityVRMod.Features.VrVisualization
 
         private struct EyeCopyResources
         {
-            public Texture SourceTexture;
-            public Texture2D DestinationTexture;
+            public RenderTexture SourceTexture;
             public IntPtr SourceNativePtr;
             public IntPtr DestinationNativePtr;
+            public int SourceDxgiFormat;
         }
 
         public bool InitializeVr(string applicationKey)
@@ -1222,9 +1226,6 @@ namespace UnityVRMod.Features.VrVisualization
 
         private void InitializeSwapchains()
         {
-            const long DxgiFormatB8G8R8A8Unorm = 87;
-            const long DxgiFormatB8G8R8A8UnormSrgb = 91;
-
             OpenXRHelper.CheckResult(
                 OpenXRAPI.xrEnumerateSwapchainFormats(_xrSession, 0, out uint formatCount, null),
                 "xrEnumerateSwapchainFormats(count)");
@@ -1240,18 +1241,35 @@ namespace UnityVRMod.Features.VrVisualization
             _supportedSwapchainFormats.Clear();
             for (int i = 0; i < returnedFormatCount; i++) _supportedSwapchainFormats.Add(formatsArray[i]);
 
-            if (_supportedSwapchainFormats.Contains(DxgiFormatB8G8R8A8UnormSrgb))
-                _selectedSwapchainFormat = DxgiFormatB8G8R8A8UnormSrgb;
-            else if (_supportedSwapchainFormats.Contains(DxgiFormatB8G8R8A8Unorm))
-                _selectedSwapchainFormat = DxgiFormatB8G8R8A8Unorm;
-            else
-                throw new Exception("The OpenXR runtime does not expose a copy-compatible BGRA8 swapchain format.");
+            ColorSpace unityColorSpace = QualitySettings.activeColorSpace;
+            const long preferredFormat = DxgiFormatB8G8R8A8UnormSrgb;
+            const long fallbackFormat = DxgiFormatB8G8R8A8Unorm;
 
-            VRModCore.Log($"Selected Swapchain Format (DXGI): {_selectedSwapchainFormat}");
+            if (_supportedSwapchainFormats.Contains(preferredFormat))
+                _selectedSwapchainFormat = preferredFormat;
+            else if (_supportedSwapchainFormats.Contains(fallbackFormat))
+                _selectedSwapchainFormat = fallbackFormat;
+            else
+                throw new Exception(
+                    "The OpenXR runtime exposes neither DXGI_FORMAT_B8G8R8A8_UNORM (87) nor " +
+                    "DXGI_FORMAT_B8G8R8A8_UNORM_SRGB (91); OpenXR initialization cannot continue safely.");
+
+            _swapchainFormatFallbackActive = _selectedSwapchainFormat != preferredFormat;
+            VRModCore.Log($"[OpenXR] Unity color space: {unityColorSpace}.");
+            VRModCore.Log($"[OpenXR] Runtime swapchain formats (DXGI): {string.Join(", ", _supportedSwapchainFormats)}.");
+            VRModCore.Log(
+                $"[OpenXR] Selected swapchain format: {_selectedSwapchainFormat}; preferred display format: {preferredFormat}; " +
+                $"explicit linear fallback conversion: {_swapchainFormatFallbackActive}.");
+            long directSourceFormat = unityColorSpace == ColorSpace.Linear
+                ? DxgiFormatB8G8R8A8UnormSrgb
+                : DxgiFormatB8G8R8A8Unorm;
+            VRModCore.Log(
+                $"[OpenXR] Color submission path: Unity {unityColorSpace} source {directSourceFormat} -> " +
+                $"swapchain {_selectedSwapchainFormat}; " +
+                $"{(_swapchainFormatFallbackActive ? "explicit sRGB-to-linear conversion" : "native bit-preserving copy")}.");
 
             _eyeSwapchains.Clear();
             _eyeSwapchainImages.Clear();
-            DestroySwapchainTextureWrappers();
 
             if (_viewConfigViews.Count != 2)
                 throw new Exception($"Primary stereo requires exactly two views; runtime returned {_viewConfigViews.Count}.");
@@ -1263,7 +1281,6 @@ namespace UnityVRMod.Features.VrVisualization
                 {
                     type = XrStructureType.XR_TYPE_SWAPCHAIN_CREATE_INFO,
                     usageFlags = XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
-                                 XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
                                  XrSwapchainUsageFlags.XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT,
                     format = _selectedSwapchainFormat,
                     sampleCount = 1,
@@ -1279,8 +1296,6 @@ namespace UnityVRMod.Features.VrVisualization
 
                 IntPtr scImagesPtr = IntPtr.Zero;
                 List<IntPtr> currentEyeTexList = [];
-                List<IntPtr> currentEyeSrvList = [];
-                List<Texture2D> currentEyeUnityTextures = [];
                 try
                 {
                     OpenXRHelper.CheckResult(
@@ -1303,84 +1318,20 @@ namespace UnityVRMod.Features.VrVisualization
                         if (swapchainImage.texture == IntPtr.Zero)
                             throw new Exception($"OpenXR returned a null D3D11 texture for eye {i}, image {j}.");
                         currentEyeTexList.Add(swapchainImage.texture);
-
-                        int srvResult = NativeBridge.CreateAndRegisterSRV(
-                            swapchainImage.texture,
-                            checked((int)_selectedSwapchainFormat),
-                            out IntPtr srv);
-                        if (srvResult < 0 || srv == IntPtr.Zero)
-                            throw new Exception($"Failed to create a D3D11 SRV for eye {i}, image {j}: HRESULT 0x{unchecked((uint)srvResult):X8}.");
-                        currentEyeSrvList.Add(srv);
-
-                        Texture2D externalTexture = Texture2D.CreateExternalTexture(
-                            (int)view.recommendedImageRectWidth,
-                            (int)view.recommendedImageRectHeight,
-                            TextureFormat.BGRA32,
-                            false,
-                            _selectedSwapchainFormat != DxgiFormatB8G8R8A8UnormSrgb,
-                            srv);
-                        if (externalTexture == null)
-                            throw new Exception($"Unity failed to wrap the OpenXR SRV for eye {i}, image {j}.");
-                        externalTexture.name = $"OpenXR_Eye{i}_SwapchainImage{j}";
-                        currentEyeUnityTextures.Add(externalTexture);
                     }
 
                     _eyeSwapchains.Add(scHandle);
                     _eyeSwapchainImages.Add(currentEyeTexList);
-                    _eyeSwapchainSrvs.Add(currentEyeSrvList);
-                    _eyeSwapchainTextures.Add(currentEyeUnityTextures);
                     scHandle = OpenXRConstants.XR_NULL_HANDLE;
                 }
                 finally
                 {
                     if (scImagesPtr != IntPtr.Zero) Marshal.FreeHGlobal(scImagesPtr);
-                    if (scHandle != OpenXRConstants.XR_NULL_HANDLE)
-                    {
-                        DestroySwapchainTextureWrappers(currentEyeUnityTextures, currentEyeSrvList);
-                    }
                     if (scHandle != OpenXRConstants.XR_NULL_HANDLE && OpenXRAPI.xrDestroySwapchain != null)
                         OpenXRAPI.xrDestroySwapchain(scHandle);
                 }
 
                 VRModCore.Log($"Swapchain for view {i} created. Images: {currentEyeTexList.Count}");
-            }
-        }
-
-        private void DestroySwapchainTextureWrappers()
-        {
-            int eyeCount = Math.Max(_eyeSwapchainTextures.Count, _eyeSwapchainSrvs.Count);
-            for (int eye = 0; eye < eyeCount; eye++)
-            {
-                List<Texture2D> textures = eye < _eyeSwapchainTextures.Count
-                    ? _eyeSwapchainTextures[eye]
-                    : null;
-                List<IntPtr> srvs = eye < _eyeSwapchainSrvs.Count
-                    ? _eyeSwapchainSrvs[eye]
-                    : null;
-                DestroySwapchainTextureWrappers(textures, srvs);
-            }
-            _eyeSwapchainTextures.Clear();
-            _eyeSwapchainSrvs.Clear();
-        }
-
-        private static void DestroySwapchainTextureWrappers(List<Texture2D> textures, List<IntPtr> srvs)
-        {
-            if (textures != null)
-            {
-                foreach (Texture2D texture in textures)
-                {
-                    if (texture != null) UnityEngine.Object.DestroyImmediate(texture);
-                }
-                textures.Clear();
-            }
-
-            if (srvs != null)
-            {
-                foreach (IntPtr srv in srvs)
-                {
-                    if (srv != IntPtr.Zero) NativeBridge.ReleaseNativeObject(srv);
-                }
-                srvs.Clear();
             }
         }
 
@@ -1753,11 +1704,20 @@ namespace UnityVRMod.Features.VrVisualization
             in EyeCopyResources left,
             in EyeCopyResources right)
         {
+            if (left.SourceDxgiFormat != right.SourceDxgiFormat)
+            {
+                RequestOpenXrTeardown(
+                    $"Native copy sources use different DXGI formats: left={left.SourceDxgiFormat}, right={right.SourceDxgiFormat}.");
+                return false;
+            }
+
             NativeCopyBatchStatus createStatus = NativeBridge.CreateD3D11CopyBatch(
                 left.DestinationNativePtr,
                 left.SourceNativePtr,
                 right.DestinationNativePtr,
                 right.SourceNativePtr,
+                left.SourceDxgiFormat,
+                checked((int)_selectedSwapchainFormat),
                 out ulong ticket);
             if (createStatus != NativeCopyBatchStatus.Pending || ticket == 0)
             {
@@ -1771,8 +1731,6 @@ namespace UnityVRMod.Features.VrVisualization
             try
             {
                 _copyCommandBuffer.Clear();
-                _copyCommandBuffer.CopyTexture(left.SourceTexture, left.DestinationTexture);
-                _copyCommandBuffer.CopyTexture(right.SourceTexture, right.DestinationTexture);
                 _copyCommandBuffer.IssuePluginEventAndData(
                     _copyRenderEventFunc,
                     _copyRenderEventId,
@@ -1806,12 +1764,12 @@ namespace UnityVRMod.Features.VrVisualization
                     ReleasePendingCopyBatch();
             }
 
-            if (terminalStatus != NativeCopyBatchStatus.Succeeded)
+            if (terminalStatus != NativeCopyBatchStatus.Submitted)
             {
                 string deviceReason = terminalStatus == NativeCopyBatchStatus.DeviceLost
                     ? $" ({DescribeLastDeviceRemovedReason()})"
                     : string.Empty;
-                RequestOpenXrTeardown($"Render-thread copy completion failed: {terminalStatus}{deviceReason}.");
+                RequestOpenXrTeardown($"Render-thread native copy submission failed: {terminalStatus}{deviceReason}.");
                 return false;
             }
 
@@ -1820,7 +1778,7 @@ namespace UnityVRMod.Features.VrVisualization
 
         private static bool IsTerminalCopyStatus(NativeCopyBatchStatus status)
         {
-            return status == NativeCopyBatchStatus.Succeeded ||
+            return status == NativeCopyBatchStatus.Submitted ||
                    status == NativeCopyBatchStatus.Cancelled ||
                    status == NativeCopyBatchStatus.InvalidResource ||
                    status == NativeCopyBatchStatus.DeviceLost;
@@ -2004,9 +1962,7 @@ namespace UnityVRMod.Features.VrVisualization
             copyResources = default;
             float renderEyeStartTime = Time.realtimeSinceStartup;
             if (eyeIndex < 0 || eyeIndex >= _eyeSwapchainImages.Count ||
-                eyeIndex >= _eyeSwapchainTextures.Count ||
                 swapchainImageIndex >= _eyeSwapchainImages[eyeIndex].Count ||
-                swapchainImageIndex >= _eyeSwapchainTextures[eyeIndex].Count ||
                 _eyeFrameStates[eyeIndex] != EyeSwapchainFrameState.Waited)
             {
                 RequestOpenXrTeardown($"Cannot render eye {eyeIndex} from swapchain image {swapchainImageIndex} in state {_eyeFrameStates[eyeIndex]}.");
@@ -2016,9 +1972,8 @@ namespace UnityVRMod.Features.VrVisualization
             Camera currentEyeCamera = (eyeIndex == 0) ? _leftVrCamera : _rightVrCamera;
             RenderTexture currentIntermediateRT = (eyeIndex == 0) ? _leftEyeIntermediateRT : _rightEyeIntermediateRT;
             IntPtr nativeTextureResourcePtr = _eyeSwapchainImages[eyeIndex][(int)swapchainImageIndex];
-            Texture2D destinationTexture = _eyeSwapchainTextures[eyeIndex][(int)swapchainImageIndex];
             XrViewConfigurationView viewConfig = _viewConfigViews[eyeIndex];
-            if (currentEyeCamera == null || nativeTextureResourcePtr == IntPtr.Zero || destinationTexture == null)
+            if (currentEyeCamera == null || nativeTextureResourcePtr == IntPtr.Zero)
             {
                 RequestOpenXrTeardown($"Eye {eyeIndex} has no camera or destination texture.");
                 return false;
@@ -2125,11 +2080,15 @@ namespace UnityVRMod.Features.VrVisualization
                 {
                     submitRenderTexture = BuildPassthroughAlphaFixedSubmitTexture(eyeIndex, currentIntermediateRT);
                 }
+                if (_swapchainFormatFallbackActive)
+                {
+                    submitRenderTexture = BuildFormatConvertedSubmitTexture(eyeIndex, submitRenderTexture);
+                }
 
                 copyResources.SourceTexture = submitRenderTexture;
-                copyResources.DestinationTexture = destinationTexture;
                 copyResources.SourceNativePtr = submitRenderTexture != null ? submitRenderTexture.GetNativeTexturePtr() : IntPtr.Zero;
                 copyResources.DestinationNativePtr = nativeTextureResourcePtr;
+                copyResources.SourceDxgiFormat = GetDxgiFormatForSubmitTexture(submitRenderTexture);
             }
 
             float renderEyeCpuMs = (Time.realtimeSinceStartup - renderEyeStartTime) * 1000f;
@@ -2142,12 +2101,139 @@ namespace UnityVRMod.Features.VrVisualization
                 _lastRightEyeRenderCpuMs = renderEyeCpuMs;
             }
             bool resourcesAreValid = copyResources.SourceTexture != null &&
-                                     copyResources.DestinationTexture != null &&
                                      copyResources.SourceNativePtr != IntPtr.Zero &&
-                                     copyResources.DestinationNativePtr != IntPtr.Zero;
+                                     copyResources.DestinationNativePtr != IntPtr.Zero &&
+                                     (copyResources.SourceDxgiFormat == DxgiFormatB8G8R8A8Unorm ||
+                                      copyResources.SourceDxgiFormat == DxgiFormatB8G8R8A8UnormSrgb);
             if (!resourcesAreValid)
                 RequestOpenXrTeardown($"Eye {eyeIndex} produced a null D3D11 copy resource.");
             return resourcesAreValid;
+        }
+
+        private static int GetDxgiFormatForSubmitTexture(RenderTexture texture)
+        {
+            if (texture == null) return 0;
+            if (texture.graphicsFormat == UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_UNorm)
+                return checked((int)DxgiFormatB8G8R8A8Unorm);
+            if (texture.graphicsFormat == UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_SRGB)
+                return checked((int)DxgiFormatB8G8R8A8UnormSrgb);
+            return 0;
+        }
+
+        private RenderTexture BuildFormatConvertedSubmitTexture(int eyeIndex, RenderTexture sourceRenderTexture)
+        {
+            if (sourceRenderTexture == null || !sourceRenderTexture.IsCreated()) return null;
+
+            var targetFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_UNorm;
+            RenderTexture target = EnsureFormatConversionRenderTexture(
+                eyeIndex, sourceRenderTexture.width, sourceRenderTexture.height, targetFormat);
+            if (target == null || !target.IsCreated()) return null;
+
+            RenderTexture conversionSource = sourceRenderTexture;
+            if (sourceRenderTexture.graphicsFormat ==
+                UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_UNorm)
+            {
+                conversionSource = EnsureGammaDecodeStagingRenderTexture(
+                    eyeIndex, sourceRenderTexture.width, sourceRenderTexture.height);
+                if (conversionSource == null || !conversionSource.IsCreated()) return null;
+
+                // Preserve the Gamma-project display bytes while changing only
+                // their local sampling interpretation to sRGB for the decode Blit.
+                Graphics.CopyTexture(sourceRenderTexture, conversionSource);
+            }
+
+            RenderTexture previousActive = RenderTexture.active;
+            bool previousSrgbWrite = GL.sRGBWrite;
+            try
+            {
+                GL.sRGBWrite = false;
+                Graphics.Blit(conversionSource, target);
+            }
+            finally
+            {
+                GL.sRGBWrite = previousSrgbWrite;
+                RenderTexture.active = previousActive;
+            }
+            return target;
+        }
+
+        private RenderTexture EnsureGammaDecodeStagingRenderTexture(int eyeIndex, int width, int height)
+        {
+            RenderTexture existing = eyeIndex == 0
+                ? _leftEyeGammaDecodeStagingRT
+                : _rightEyeGammaDecodeStagingRT;
+            var graphicsFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_SRGB;
+            bool needsRecreation = existing == null ||
+                                   !existing.IsCreated() ||
+                                   existing.width != width ||
+                                   existing.height != height ||
+                                   existing.antiAliasing != 1 ||
+                                   existing.graphicsFormat != graphicsFormat;
+            if (!needsRecreation) return existing;
+
+            if (existing != null)
+            {
+                existing.Release();
+                UnityEngine.Object.Destroy(existing);
+            }
+
+            RenderTexture created = new(width, height, 0, graphicsFormat)
+            {
+                name = eyeIndex == 0 ? "OpenXR_LeftEyeGammaDecodeStagingRT" : "OpenXR_RightEyeGammaDecodeStagingRT",
+                antiAliasing = 1,
+                useMipMap = false,
+                autoGenerateMips = false,
+                filterMode = FilterMode.Bilinear
+            };
+            if (!created.Create())
+            {
+                UnityEngine.Object.Destroy(created);
+                created = null;
+            }
+
+            if (eyeIndex == 0) _leftEyeGammaDecodeStagingRT = created;
+            else _rightEyeGammaDecodeStagingRT = created;
+            return created;
+        }
+
+        private RenderTexture EnsureFormatConversionRenderTexture(
+            int eyeIndex,
+            int width,
+            int height,
+            UnityEngine.Experimental.Rendering.GraphicsFormat graphicsFormat)
+        {
+            RenderTexture existing = eyeIndex == 0 ? _leftEyeFormatConversionRT : _rightEyeFormatConversionRT;
+            bool needsRecreation = existing == null ||
+                                   !existing.IsCreated() ||
+                                   existing.width != width ||
+                                   existing.height != height ||
+                                   existing.antiAliasing != 1 ||
+                                   existing.graphicsFormat != graphicsFormat;
+            if (!needsRecreation) return existing;
+
+            if (existing != null)
+            {
+                existing.Release();
+                UnityEngine.Object.Destroy(existing);
+            }
+
+            RenderTexture created = new(width, height, 0, graphicsFormat)
+            {
+                name = eyeIndex == 0 ? "OpenXR_LeftEyeFormatConversionRT" : "OpenXR_RightEyeFormatConversionRT",
+                antiAliasing = 1,
+                useMipMap = false,
+                autoGenerateMips = false,
+                filterMode = FilterMode.Bilinear
+            };
+            if (!created.Create())
+            {
+                UnityEngine.Object.Destroy(created);
+                created = null;
+            }
+
+            if (eyeIndex == 0) _leftEyeFormatConversionRT = created;
+            else _rightEyeFormatConversionRT = created;
+            return created;
         }
 
         private RenderTexture BuildPassthroughAlphaFixedSubmitTexture(int eyeIndex, RenderTexture sourceRenderTexture)
@@ -2162,7 +2248,19 @@ namespace UnityVRMod.Features.VrVisualization
             _passthroughAlphaFixMaterial.SetColor("_KeyColor", passthroughKeyColor);
             _passthroughAlphaFixMaterial.SetFloat("_Threshold", PassthroughKeyColorThreshold);
 
-            Graphics.Blit(sourceRenderTexture, targetRenderTexture, _passthroughAlphaFixMaterial);
+            RenderTexture previousActive = RenderTexture.active;
+            bool previousSrgbWrite = GL.sRGBWrite;
+            try
+            {
+                GL.sRGBWrite = targetRenderTexture.graphicsFormat ==
+                    UnityEngine.Experimental.Rendering.GraphicsFormat.B8G8R8A8_SRGB;
+                Graphics.Blit(sourceRenderTexture, targetRenderTexture, _passthroughAlphaFixMaterial);
+            }
+            finally
+            {
+                GL.sRGBWrite = previousSrgbWrite;
+                RenderTexture.active = previousActive;
+            }
             return targetRenderTexture;
         }
 
@@ -5184,6 +5282,10 @@ namespace UnityVRMod.Features.VrVisualization
             if (_rightEyeIntermediateRT != null) { _rightEyeIntermediateRT.Release(); UnityEngine.Object.Destroy(_rightEyeIntermediateRT); _rightEyeIntermediateRT = null; }
             if (_leftEyePassthroughAlphaFixedRT != null) { _leftEyePassthroughAlphaFixedRT.Release(); UnityEngine.Object.Destroy(_leftEyePassthroughAlphaFixedRT); _leftEyePassthroughAlphaFixedRT = null; }
             if (_rightEyePassthroughAlphaFixedRT != null) { _rightEyePassthroughAlphaFixedRT.Release(); UnityEngine.Object.Destroy(_rightEyePassthroughAlphaFixedRT); _rightEyePassthroughAlphaFixedRT = null; }
+            if (_leftEyeFormatConversionRT != null) { _leftEyeFormatConversionRT.Release(); UnityEngine.Object.Destroy(_leftEyeFormatConversionRT); _leftEyeFormatConversionRT = null; }
+            if (_rightEyeFormatConversionRT != null) { _rightEyeFormatConversionRT.Release(); UnityEngine.Object.Destroy(_rightEyeFormatConversionRT); _rightEyeFormatConversionRT = null; }
+            if (_leftEyeGammaDecodeStagingRT != null) { _leftEyeGammaDecodeStagingRT.Release(); UnityEngine.Object.Destroy(_leftEyeGammaDecodeStagingRT); _leftEyeGammaDecodeStagingRT = null; }
+            if (_rightEyeGammaDecodeStagingRT != null) { _rightEyeGammaDecodeStagingRT.Release(); UnityEngine.Object.Destroy(_rightEyeGammaDecodeStagingRT); _rightEyeGammaDecodeStagingRT = null; }
             if (_passthroughAlphaFixMaterial != null) { UnityEngine.Object.Destroy(_passthroughAlphaFixMaterial); _passthroughAlphaFixMaterial = null; }
             if (_passthroughAlphaFixAssetBundle != null && _passthroughAlphaFixAssetBundleUnloadMethod != null)
             {
@@ -5302,7 +5404,6 @@ namespace UnityVRMod.Features.VrVisualization
                 if (_pFbPassthroughCompositionLayer != IntPtr.Zero) { Marshal.FreeHGlobal(_pFbPassthroughCompositionLayer); _pFbPassthroughCompositionLayer = IntPtr.Zero; }
                 if (_pLayersForSubmit != IntPtr.Zero) { Marshal.FreeHGlobal(_pLayersForSubmit); _pLayersForSubmit = IntPtr.Zero; }
 
-                DestroySwapchainTextureWrappers();
                 if (!skipXrRuntimeCalls)
                 {
                     foreach (ulong sc in _eyeSwapchains)
@@ -5347,6 +5448,7 @@ namespace UnityVRMod.Features.VrVisualization
                 _locatedViews = null;
                 _projectionLayerViews = null;
                 _selectedSwapchainFormat = 0;
+                _swapchainFormatFallbackActive = false;
                 _xrSystemId = OpenXRConstants.XR_NULL_SYSTEM_ID;
                 _currentSessionState = XrSessionState.XR_SESSION_STATE_UNKNOWN;
                 _isSessionRunning = false;

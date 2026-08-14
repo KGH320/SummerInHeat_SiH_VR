@@ -8,7 +8,7 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
         Unknown = -1,
         Pending = 0,
         Executing = 1,
-        Succeeded = 2,
+        Submitted = 2,
         Cancelled = 3,
         InvalidResource = 4,
         DeviceLost = 5,
@@ -18,7 +18,7 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
     internal static class NativeBridge
     {
         private const string NativeHelperDll = "UnityGraphicsHelper";
-        public const uint RequiredAbiVersion = 2;
+        public const uint RequiredAbiVersion = 4;
 
         [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "GetUnityGraphicsHelperAbiVersion")]
         private static extern uint GetUnityGraphicsHelperAbiVersion_Internal();
@@ -47,6 +47,8 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
             IntPtr sourceLeft,
             IntPtr destinationRight,
             IntPtr sourceRight,
+            int expectedSourceDxgiFormat,
+            int expectedDxgiFormat,
             out ulong ticket);
 
         [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "WaitD3D11CopyBatch")]
@@ -57,12 +59,6 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
 
         [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ReleaseD3D11CopyBatch")]
         public static extern void ReleaseD3D11CopyBatch(ulong ticket);
-
-        [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "CreateAndRegisterSRV")]
-        public static extern int CreateAndRegisterSRV(IntPtr textureResource, int srvFormatDxgi, out IntPtr srv);
-
-        [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "ReleaseNativeObject")]
-        public static extern void ReleaseNativeObject(IntPtr nativeObject);
 
         [DllImport(NativeHelperDll, CallingConvention = CallingConvention.Cdecl, EntryPoint = "GetD3D11Device")]
         private static extern IntPtr GetCachedD3D11Device_Internal();
@@ -119,7 +115,7 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
 
                 if (d3d11Device == IntPtr.Zero || copyRenderEvent == IntPtr.Zero || deviceGeneration == 0)
                 {
-                    error = "UnityGraphicsHelper ABI v2 initialized without a valid D3D11 device, render callback, or device generation.";
+                    error = $"UnityGraphicsHelper ABI v{RequiredAbiVersion} initialized without a valid D3D11 device, render callback, or device generation.";
                     return false;
                 }
 
@@ -137,7 +133,7 @@ namespace UnityVRMod.Features.VRVisualization.OpenXR
             }
             catch (Exception ex)
             {
-                VRModCore.LogError("UnityGraphicsHelper ABI v2 initialization failed:", ex);
+                VRModCore.LogError($"UnityGraphicsHelper ABI v{RequiredAbiVersion} initialization failed:", ex);
                 error = ex.Message;
                 return false;
             }

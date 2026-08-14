@@ -99,8 +99,8 @@ jobs:
           }
           "@
           $abiVersion = [UnityGraphicsHelperAbiProbe]::GetUnityGraphicsHelperAbiVersion()
-          if ($abiVersion -ne 2) {
-            throw "UnityGraphicsHelper ABI v2 is required; native helper returned v$abiVersion."
+          if ($abiVersion -ne 4) {
+            throw "UnityGraphicsHelper ABI v4 is required; native helper returned v$abiVersion."
           }
 
           $exports = & $dumpbin.FullName /exports $nativeReference
@@ -115,6 +115,13 @@ jobs:
             $escapedName = [regex]::Escape($requiredExport)
             if ($exportText -notmatch "(?m)^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+$escapedName(?:\s|$)") {
               throw "Required native export '$requiredExport' was not found."
+            }
+          }
+
+          foreach ($obsoleteExport in @('CreateAndRegisterSRV', 'ReleaseNativeObject')) {
+            $escapedName = [regex]::Escape($obsoleteExport)
+            if ($exportText -match "(?m)^\s+\d+\s+[0-9A-F]+\s+[0-9A-F]+\s+$escapedName(?:\s|$)") {
+              throw "Obsolete native export is still present: $obsoleteExport"
             }
           }
 
