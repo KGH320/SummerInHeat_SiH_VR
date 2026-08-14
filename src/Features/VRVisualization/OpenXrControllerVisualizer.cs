@@ -551,17 +551,56 @@ namespace UnityVRMod.Features.VrVisualization
                 if (_boundColliderLayoutSet != null)
                 {
                     OpenXrHandModelAnchorRegistry.Update(_isLeftHand, _boundColliderLayoutSet.BuildWorldColliderPoses());
-                    return;
+                }
+                else
+                {
+                    OpenXrHandModelAnchorRegistry.Update(
+                        _isLeftHand,
+                        _palm,
+                        _thumb.Tip,
+                        _index.Tip,
+                        _middle.Tip,
+                        _ring.Tip,
+                        _little.Tip);
                 }
 
-                OpenXrHandModelAnchorRegistry.Update(
+                OpenXrHandModelAnchorRegistry.UpdateGripPose(
                     _isLeftHand,
-                    _palm,
-                    _thumb.Tip,
-                    _index.Tip,
+                    ResolveGrabPalmPosition(),
+                    _palm.rotation,
                     _middle.Tip,
                     _ring.Tip,
                     _little.Tip);
+            }
+
+            private Vector3 ResolveGrabPalmPosition()
+            {
+                Vector3 fingerBaseCenter = Vector3.zero;
+                int fingerBaseCount = 0;
+                AddFingerBase(_index, ref fingerBaseCenter, ref fingerBaseCount);
+                AddFingerBase(_middle, ref fingerBaseCenter, ref fingerBaseCount);
+                AddFingerBase(_ring, ref fingerBaseCenter, ref fingerBaseCount);
+                AddFingerBase(_little, ref fingerBaseCenter, ref fingerBaseCount);
+
+                if (fingerBaseCount < 2)
+                {
+                    return _palm.position;
+                }
+
+                fingerBaseCenter /= fingerBaseCount;
+                return Vector3.Lerp(_palm.position, fingerBaseCenter, 0.55f);
+            }
+
+            private static void AddFingerBase(RuntimeFingerBones finger, ref Vector3 total, ref int count)
+            {
+                Transform fingerBase = finger?.BaseBone;
+                if (fingerBase == null)
+                {
+                    return;
+                }
+
+                total += fingerBase.position;
+                count++;
             }
 
             private static void ApplyFingerCurl(RuntimeFingerBones finger, float curl, float curlDegrees)

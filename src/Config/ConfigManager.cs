@@ -71,6 +71,9 @@ namespace UnityVRMod.Config
         public static ConfigElement<float> OpenXR_DynamicBoneHandColliderRadius;
         public static ConfigElement<bool> OpenXR_EnableMagicaClothHandColliders;
         public static ConfigElement<float> OpenXR_MagicaClothHandColliderRadius;
+        public static ConfigElement<bool> OpenXR_EnableMagicaClothGrab;
+        public static ConfigElement<float> OpenXR_MagicaClothGrabRadius;
+        public static ConfigElement<int> OpenXR_MagicaClothGrabMaxParticles;
         public static ConfigElement<string> OpenXR_ForceDefaultRenderScenes;
         public static ConfigElement<string> OpenXR_ForceSolidClearScenes;
         public static ConfigElement<KeyCode> OpenXR_TogglePassthroughKey;
@@ -276,6 +279,15 @@ namespace UnityVRMod.Config
 
             OpenXR_MagicaClothHandColliderRadius = new ConfigElement<float>("OpenXR MagicaCloth Hand Collider Radius",
                 "[OpenXR ONLY] Radius in meters for the experimental MagicaCloth2 hand collider proxies.", 0.06f);
+
+            OpenXR_EnableMagicaClothGrab = new ConfigElement<bool>("OpenXR Enable MagicaCloth Grab",
+                "[OpenXR ONLY] Experimental: Grip captures nearby movable MagicaCloth2 particles and temporarily binds them to the hand.", true);
+
+            OpenXR_MagicaClothGrabRadius = new ConfigElement<float>("OpenXR MagicaCloth Grab Radius",
+                "[OpenXR ONLY] Particle search radius in meters for the experimental MagicaCloth2 Grip grab.", 0.075f);
+
+            OpenXR_MagicaClothGrabMaxParticles = new ConfigElement<int>("OpenXR MagicaCloth Grab Max Particles",
+                "[OpenXR ONLY] Maximum movable MagicaCloth2 particles captured by each hand.", 4);
 
             OpenXR_ForceDefaultRenderScenes = new ConfigElement<string>("OpenXR Force Default Render Scenes",
                 "[OpenXR ONLY] Forces safe default VR eye-camera render state in specific scenes to avoid artifacts from copied main-camera settings. Format: 'SceneNameA;SceneNameB;'.", "");

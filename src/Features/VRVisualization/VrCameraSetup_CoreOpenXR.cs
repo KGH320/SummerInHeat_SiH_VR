@@ -148,6 +148,7 @@ namespace UnityVRMod.Features.VrVisualization
 #endif
         private readonly OpenXrDynamicBoneHandColliders _dynamicBoneHandColliders = new();
         private readonly OpenXrMagicaClothHandColliders _magicaClothHandColliders = new();
+        private readonly OpenXrMagicaClothGrabber _magicaClothGrabber = new();
         private readonly OpenXrUiInteractor _uiInteractor = new();
         private readonly OpenXrUiProjectionPlane _uiProjectionPlane = new();
         private readonly OpenXrDanmenProjectionPlane _danmenProjectionPlane = new();
@@ -2450,16 +2451,15 @@ namespace UnityVRMod.Features.VrVisualization
             // 传送和转向始终使用右手摇杆，不受控制手配置影响
             OpenXrVector2LogState turnThumbstickState = _rightThumbstickAxisLogState;
             OpenXrBooleanLogState turnThumbstickClickState = _rightThumbstickClickLogState;
-            OpenXrFloatLogState activeGripState = useLeftControlHand ? _leftGripLogState : _rightGripLogState;
             bool leftTriggerPressed = IsTriggerPressed(_leftTriggerLogState);
             bool rightTriggerPressed = IsTriggerPressed(_rightTriggerLogState);
-            bool leftGripPressed = GetFloatActionValue(_leftGripLogState) >= GripHoldThreshold;
-            bool rightGripPressed = GetFloatActionValue(_rightGripLogState) >= GripHoldThreshold;
+            float leftGripValue = GetFloatActionValue(_leftGripLogState);
+            float rightGripValue = GetFloatActionValue(_rightGripLogState);
+            bool leftGripPressed = leftGripValue >= GripHoldThreshold;
+            bool rightGripPressed = rightGripValue >= GripHoldThreshold;
             float turnStickX = GetThumbstickX(turnThumbstickState);
             float turnStickY = GetThumbstickY(turnThumbstickState);
             bool isSmoothTurnHeld = IsBooleanActionPressed(turnThumbstickClickState);
-            float activeGripValue = GetFloatActionValue(activeGripState);
-            bool isGripHeld = activeGripValue >= GripHoldThreshold || leftGripPressed || rightGripPressed;
             // Y(左)/B(右) 单击：跟随/锚定切换
             bool yOrBPressed = IsBooleanActionPressed(_leftYLogState) || IsBooleanActionPressed(_rightBLogState);
             bool isUiTogglePressed = yOrBPressed && !_wasUiTogglePressed;
@@ -2564,6 +2564,10 @@ namespace UnityVRMod.Features.VrVisualization
 
             bool hasGripLocalPose = false;
             Vector3 activeGripLocalPos = default;
+            bool hasLeftGripLocalPose = false;
+            Vector3 leftGripLocalPos = default;
+            bool hasRightGripLocalPose = false;
+            Vector3 rightGripLocalPos = default;
             bool hasLeftHandWorldPose = false;
             Vector3 leftHandWorldPos = default;
             Quaternion leftHandWorldRot = Quaternion.identity;
@@ -2572,21 +2576,8 @@ namespace UnityVRMod.Features.VrVisualization
             Quaternion rightHandWorldRot = Quaternion.identity;
             if (hasValidViewPose)
             {
-                bool hasLeftGripLP = TryGetLeftGripPoseLocalPosition(_xrFrameState.predictedDisplayTime, out Vector3 leftGripLP);
-                bool hasRightGripLP = TryGetRightGripPoseLocalPosition(_xrFrameState.predictedDisplayTime, out Vector3 rightGripLP);
-
-                // 锁定到当前按下的手
-                if (leftGripPressed)
-                    _activeGripHand = OpenXrControlHand.Left;
-                else if (rightGripPressed)
-                    _activeGripHand = OpenXrControlHand.Right;
-                bool useLeftForGrip = _activeGripHand.HasValue
-                    ? _activeGripHand.Value == OpenXrControlHand.Left
-                    : useLeftControlHand;
-                bool gripHandChanged = _activeGripHand != _lastActiveGripHand;
-                hasGripLocalPose = gripHandChanged ? false : (useLeftForGrip ? hasLeftGripLP : hasRightGripLP);
-                activeGripLocalPos = useLeftForGrip ? leftGripLP : rightGripLP;
-                _lastActiveGripHand = _activeGripHand;
+                hasLeftGripLocalPose = TryGetLeftGripPoseLocalPosition(_xrFrameState.predictedDisplayTime, out leftGripLocalPos);
+                hasRightGripLocalPose = TryGetRightGripPoseLocalPosition(_xrFrameState.predictedDisplayTime, out rightGripLocalPos);
 
                 hasLeftHandWorldPose = TryGetLeftGripPoseWorldTransform(_xrFrameState.predictedDisplayTime, out leftHandWorldPos, out leftHandWorldRot);
                 hasRightHandWorldPose = TryGetRightGripPoseWorldTransform(_xrFrameState.predictedDisplayTime, out rightHandWorldPos, out rightHandWorldRot);
@@ -2606,6 +2597,37 @@ namespace UnityVRMod.Features.VrVisualization
                 GetFloatActionValue(_rightGripLogState),
                 GetTriggerActionValue(_rightTriggerLogState),
                 activeControlHand);
+
+            _magicaClothGrabber.Update(
+                hasLeftHandWorldPose,
+                leftGripValue,
+                hasRightHandWorldPose,
+                rightGripValue);
+
+            leftGripPressed &= !_magicaClothGrabber.ShouldConsumeGrip(isLeftHand: true);
+            rightGripPressed &= !_magicaClothGrabber.ShouldConsumeGrip(isLeftHand: false);
+            bool isGripHeld = leftGripPressed || rightGripPressed;
+
+            if ((_activeGripHand == OpenXrControlHand.Left && !leftGripPressed)
+                || (_activeGripHand == OpenXrControlHand.Right && !rightGripPressed))
+            {
+                _activeGripHand = null;
+            }
+
+            if (leftGripPressed)
+                _activeGripHand = OpenXrControlHand.Left;
+            else if (rightGripPressed)
+                _activeGripHand = OpenXrControlHand.Right;
+
+            bool useLeftForGrip = _activeGripHand.HasValue
+                ? _activeGripHand.Value == OpenXrControlHand.Left
+                : useLeftControlHand;
+            bool gripHandChanged = _activeGripHand != _lastActiveGripHand;
+            hasGripLocalPose = gripHandChanged
+                ? false
+                : (useLeftForGrip ? hasLeftGripLocalPose : hasRightGripLocalPose);
+            activeGripLocalPos = useLeftForGrip ? leftGripLocalPos : rightGripLocalPos;
+            _lastActiveGripHand = _activeGripHand;
 
 #if PHYSICS_LOG
             _physicsDiagnostics.Update(
@@ -5271,6 +5293,7 @@ namespace UnityVRMod.Features.VrVisualization
 #endif
             _dynamicBoneHandColliders.Reset();
             _magicaClothHandColliders.Reset();
+            _magicaClothGrabber.Reset();
             _uiProjectionPlane.Teardown();
             _uiInteractor.Teardown();
             _danmenProjectionPlane.Teardown();

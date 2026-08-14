@@ -39,6 +39,18 @@ namespace UnityVRMod.Features.VrVisualization
         public float RadiusScale { get; }
     }
 
+    internal readonly struct OpenXrHandWorldGripPose
+    {
+        public OpenXrHandWorldGripPose(Vector3 worldPosition, Quaternion worldRotation)
+        {
+            WorldPosition = worldPosition;
+            WorldRotation = worldRotation;
+        }
+
+        public Vector3 WorldPosition { get; }
+        public Quaternion WorldRotation { get; }
+    }
+
     internal static class OpenXrHandPoseModel
     {
         public const int FallbackColliderPoseCount = 6;
@@ -66,21 +78,76 @@ namespace UnityVRMod.Features.VrVisualization
         private static readonly OpenXrHandWorldColliderPose[] RightPoses = new OpenXrHandWorldColliderPose[OpenXrHandPoseModel.MaxColliderPoseCount];
         private static bool _hasLeftPoses;
         private static bool _hasRightPoses;
+        private static bool _hasLeftGripPose;
+        private static bool _hasRightGripPose;
         private static int _leftPoseCount;
         private static int _rightPoseCount;
+        private static OpenXrHandWorldGripPose _leftGripPose;
+        private static OpenXrHandWorldGripPose _rightGripPose;
 
         public static void Clear(bool isLeftHand)
         {
             if (isLeftHand)
             {
                 _hasLeftPoses = false;
+                _hasLeftGripPose = false;
                 _leftPoseCount = 0;
             }
             else
             {
                 _hasRightPoses = false;
+                _hasRightGripPose = false;
                 _rightPoseCount = 0;
             }
+        }
+
+        public static void UpdateGripPose(
+            bool isLeftHand,
+            Vector3 palmPosition,
+            Quaternion palmRotation,
+            Transform middleTip,
+            Transform ringTip,
+            Transform littleTip)
+        {
+            bool hasGripAnchors = middleTip != null && ringTip != null && littleTip != null;
+            if (!hasGripAnchors)
+            {
+                if (isLeftHand)
+                {
+                    _hasLeftGripPose = false;
+                }
+                else
+                {
+                    _hasRightGripPose = false;
+                }
+
+                return;
+            }
+
+            Vector3 fingertipCenter = (middleTip.position + ringTip.position + littleTip.position) / 3f;
+            var pose = new OpenXrHandWorldGripPose(
+                Vector3.Lerp(palmPosition, fingertipCenter, 0.35f),
+                palmRotation);
+
+            if (isLeftHand)
+            {
+                _leftGripPose = pose;
+                _hasLeftGripPose = true;
+            }
+            else
+            {
+                _rightGripPose = pose;
+                _hasRightGripPose = true;
+            }
+        }
+
+        public static bool TryGetWorldGripPose(bool isLeftHand, out Vector3 worldPosition, out Quaternion worldRotation)
+        {
+            bool hasPose = isLeftHand ? _hasLeftGripPose : _hasRightGripPose;
+            OpenXrHandWorldGripPose pose = isLeftHand ? _leftGripPose : _rightGripPose;
+            worldPosition = pose.WorldPosition;
+            worldRotation = pose.WorldRotation;
+            return hasPose;
         }
 
         public static void Update(bool isLeftHand, Transform palm, Transform thumbTip, Transform indexTip, Transform middleTip, Transform ringTip, Transform littleTip)
