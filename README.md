@@ -13,6 +13,7 @@
 *   **Dynamic UI Management**: Reposition and scale in-game UI panels in VR.
 *   **Seamless Perspective**: Optimized first-person camera bindings and fixed scene transitions.
 *   **Physics Interaction Support**: Interact with physics-enabled parts such as hair, breasts, and skirts.
+*   **Skirt Control Support**: When near physics-enabled clothing (primarily skirts), press the Grip button to control nearby clothing.
 
 ---
 
